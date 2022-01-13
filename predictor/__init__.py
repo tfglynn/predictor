@@ -1244,7 +1244,7 @@ class Form(Widget):
             curcol = curcol + width + 1
             nextrow = max(currow + height + 1, nextrow)
 
-class Canvas(Decorator):
+class Canvas(Decorator, Writer):
     def __init__(self, child=None, rows=None, cols=None, begin_row=0, begin_col=0):
         super().__init__(child)
         if not rows:
@@ -1254,7 +1254,8 @@ class Canvas(Decorator):
         self._fast_quit_enabled = True
         self._window = curses.newwin(rows, cols, begin_row, begin_col)
         self._window.keypad(True) # Makes arrow keys work
-        self._panel  = panel.new_panel(self._window)
+        self._panel = panel.new_panel(self._window)
+        self._attrs = curses.A_NORMAL
 
     def set_background(self, color):
         self._window.bkgd(" ", curses.color_pair(color))
@@ -1276,7 +1277,7 @@ class Canvas(Decorator):
 
     def draw(self):
         self._window.erase()
-        self._decorated.draw(CanvasWriter(self))
+        self._decorated.draw(self)
         self._window.noutrefresh()
         curses.doupdate()
 
@@ -1286,11 +1287,6 @@ class Canvas(Decorator):
         handled = self._decorated.handle_key(k)
         return k, handled
 
-class CanvasWriter(Writer):
-    def __init__(self, canvas):
-        self._canvas = canvas
-        self._attrs = curses.A_NORMAL 
-
     def set_attributes(self, attrs):
         self._attrs = attrs
 
@@ -1298,15 +1294,15 @@ class CanvasWriter(Writer):
         return self._attrs
 
     def dim(self):
-        return self._canvas._window.getmaxyx()
+        return self._window.getmaxyx()
 
     def write(self, row, col, text):
         attrs = self._attrs
         try:
             if len(text) == 1:
-                self._canvas._window.addch(row, col, text, attrs)
+                self._window.addch(row, col, text, attrs)
             else:
-                self._canvas._window.addstr(row, col, text, attrs)
+                self._window.addstr(row, col, text, attrs)
         except curses.error:
             # This is necessary for writing on the right edge of the window.
             pass
