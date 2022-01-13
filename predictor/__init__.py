@@ -1104,10 +1104,11 @@ class Form(Widget):
         def __getattr__(self, name):
             return getattr(self._widget, name)
 
-    def __init__(self):
+    def __init__(self, title=None):
         self._fields = {}
         self._focused = False
         self._focused_field = None
+        self._title = title
 
     def focus(self):
         ff = self._focused_field
@@ -1217,6 +1218,10 @@ class Form(Widget):
         currow = nextrow = 0
         curcol = 0
         ff = self._focused_field
+        if self._title:
+            with writer.set(curses.A_BOLD):
+                writer.write(0, 0, self._title.center(maxcol))
+            currow += 1
         for label, field in self._fields.items():
             display = "*" + field._display if field._required else field._display
             width_needed = max(len(display), field.min_width())
@@ -1664,7 +1669,7 @@ class App:
         self._quitting = False
         self._session = session
 
-        form = Shadow(Box(Fill(Form()), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═"))
+        form = Shadow(Box(Fill(Form("New Question")), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═"))
         title = Box(TextLineInput(placeholder="Write your question title here"))
         calendar = Box(Calendar())
         clock = Box(Clock())
