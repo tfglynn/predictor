@@ -1564,19 +1564,6 @@ class BarGraph(Graph):
                 missing = len(line_groups) - can_show
                 writer.write(height_used + 2, label_width + 1, f"┆ ({missing} more not shown)")
 
-#
-#        self.noutrefresh()
-#
-#    def populate(self, question, predictions):
-#        self._question = question
-#        self._predictions = predictions
-#
-#    def maximize(self):
-#        self._window.resize(curses.LINES, curses.COLS)
-#        self._window.mvwin(0, 0)
-#        self._panel.top()
-#        panel.update_panels()
-
 # TODO: need to figure this out
 class Topbar:
     def __init__(self):
