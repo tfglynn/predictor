@@ -6,9 +6,10 @@ import json
 import numpy as np
 import os
 import textwrap
-from collections import defaultdict, OrderedDict
+from collections import defaultdict
 from curses import panel
 from enum import Enum
+from functools import partial
 from math import ceil, exp, factorial, log, pi, sqrt
 from scipy.special import gamma as gammafun
 from sqlalchemy import Boolean, Column, ForeignKey, Integer, Numeric, String, DateTime, create_engine
@@ -154,238 +155,457 @@ class Exponential(Continuous):
     def sd(self):
         return 1/self._λ
 
-# TODO: we need a better system for this
-class Key:
-    QUIT = ord("q")
-    CLOSE = ord("x")
+def ensure_not_str(c):
+    if isinstance(c, str):
+        return ord(c)
+    return c
 
-# This can be subclassed to make testing graphs etc possible.
+class Key:
+    def __init__(self, c, aliases=[], name=None):
+        if name is None:
+            name = c
+        self._name = name
+        c = ensure_not_str(c)
+        self._primary = c
+        if isinstance(c, str):
+            c = ord(c)
+        self._aliases = {ensure_not_str(a) for a in aliases}
+        self._aliases.add(c)
+
+    def __str__(self):
+        return chr(self._primary)
+
+    def isalpha(self):
+        return str(self).isalpha()
+
+    def isprint(self):
+        return str(self).isprintable()
+
+    def isspace(self):
+        return str(self).isspace()
+
+    def __eq__(self, other):
+        return not self._aliases.isdisjoint(other._aliases)
+
+    def __repr__(self):
+        return f"<Key {self._name} ({self._primary})>"
+
+Key.QUIT  = Key("q")
+Key.CLOSE = Key("x")
+Key.SPACE = Key(" ", name="<Space>")
+Key.TAB   = Key("\t", name="<Tab>")
+Key.BACK_TAB = Key(curses.KEY_BTAB, name="<Back Tab>")
+Key.LEFT  = Key(curses.KEY_LEFT, ["h"], "Left")
+Key.RIGHT = Key(curses.KEY_RIGHT, ["l"], "Right")
+Key.UP    = Key(curses.KEY_UP, ["k"], "Up")
+Key.DOWN  = Key(curses.KEY_DOWN, ["j"], "Down")
+Key.BACKSPACE = Key(curses.KEY_BACKSPACE, ["\b"], "Backspace")
+Key.ENTER = Key("\n", name="<Enter>")
+
+class Widget:
+    def handle_key(self, k):
+        return False
+
+    def min_width(self):
+        raise NotImplementedError(self.__class__)
+
+    def min_height(self):
+        raise NotImplementedError(self.__class__)
+
+    def dim(self, maxrow, maxcol):
+        raise NotImplementedError(self.__class__)
+
+    def draw(self, writer):
+        pass
+
+    def focus(self):
+        self._focused = True
+
+    def unfocus(self):
+        self._focused = False
+
+    def find(self, cls):
+        return None
+
+    def contents(self):
+        return None
+
 class Writer:
     def write(self, row, col, text):
         pass
 
-class Widget(Writer):
-    def __init__(self, nrow, ncol, begin_row, begin_col):
-        self._window  = curses.newwin(nrow, ncol, begin_row, begin_col)
-        self._panel   = panel.new_panel(self._window)
-        self._keymap  = {}
-        self._window.keypad(True) # Makes arrow keys work
-        self.addkey("q", self.quit)
-        self._panel.top()
-        panel.update_panels()
+    def dim(self):
+        pass
 
-    def write(self, row, col, text, *attr):
-        try:
-            if len(text) == 1:
-                self._window.addch(row, col, text, *attr)
+    def set(self, attr):
+        return AttributeSetter(self, attr)
+
+class AttributeSetter:
+    def __init__(self, writer, attr):
+        self._writer = writer
+        self._attr = attr
+        self._saved = None
+
+    def __enter__(self):
+        self._saved = self._writer.get_attributes()
+        self._writer.set_attributes(self._saved | self._attr)
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None:
+            return False
+        self._writer.set_attributes(self._saved)
+        return True
+
+class Crop(Writer):
+    def __init__(self, wrapped, amounts):
+        if isinstance(amounts, list):
+            if len(amounts) not in [1, 2, 4]:
+                raise ValueError # TODO
+            if len(amounts) == 1:
+                lcrop = rcrop = tcrop = bcrop = amounts[0]
+            elif len(amounts) == 2:
+                tcrop = bcrop = amounts[0]
+                lcrop = rcrop = amounts[1]
             else:
-                self._window.addstr(row, col, text, *attr)
-        except curses.error:
-            # This is necessary for writing on the right edge of the window.
-            pass
+                [tcrop, rcrop, bcrop, lcrop] = amounts
+        else: # Just one value
+            lcrop = rcrop = tcrop = bcrop = amounts
+        self._lcrop = lcrop
+        self._rcrop = rcrop
+        self._tcrop = tcrop
+        self._bcrop = bcrop
+        self._wrapped = wrapped
 
-    def center(self):
-        height, width = self.maxrowcol()
-        screen_height = curses.LINES
-        screen_width  = curses.COLS
-        vpad = (screen_height - height) // 2
-        hpad = (screen_width - width) // 2
-        self._panel.move(vpad, hpad)
-        panel.update_panels()
+    def __getattr__(self, name):
+        return getattr(self._wrapped, name)
 
-    def hide(self):
-        self._panel.hide()
-        panel.update_panels()
+    def dim(self):
+        r, c = self._wrapped.dim()
+        r -= self._tcrop + self._bcrop
+        c -= self._lcrop + self._rcrop
+        return r, c
 
-    def show(self):
-        self._panel.show()
-        panel.update_panels()
+    def write(self, r, c, text):
+        self._wrapped.write(r + self._tcrop, c + self._lcrop, text)
 
-    def top(self):
-        self._panel.top()
-        panel.update_panels()
+class Empty(Widget):
+    def min_width(self):
+        return 0
 
-    def noutrefresh(self):
-        self.show()
-        self._window.noutrefresh()
+    def min_height(self):
+        return 0
 
-    def quit(self):
-        raise QuitCommand
+    def dim(self, maxrow, maxcol):
+        return 0, 0
 
-    def maxrowcol(self):
-        return self._window.getmaxyx()
+    def draw(self, writer):
+        pass
 
-    def addkey(self, key, callback, aliases=[]):
-        keys = [key] + aliases
-        for key in keys:
-            if isinstance(key, str):
-                key = ord(key)
-            self._keymap[key] = callback
+class Decorator(Widget):
+    def __init__(self, decorated=Empty()):
+        self._decorated = decorated
 
-    def delkey(self, key, callback):
-        # TODO: handle aliases?
-        del(self._keymap[key])
+    def focus(self):
+        self._decorated.focus()
 
-    def react(self):
-        self._panel.show()
-        self._panel.top()
-        panel.update_panels()
-        curses.doupdate()
-        c = self._window.getch()
-        try:
-            callback = self._keymap[c]
-            callback()
-        except KeyError:
-            pass
-        return c
+    def unfocus(self):
+        self._decorated.unfocus()
 
-class Shadow(Widget):
-    def draw(self):
-        #shade = "░▒▓▞"
-        shade = "░"
-        tl = "┌"; tr = "┐"
-        bl = "└"; br = "┘"
-        side = "│"; flat = "─"
+    def handle_key(self, k):
+        return self._decorated.handle_key(k)
 
-        maxrow, maxcol = super().maxrowcol()
+    def contents(self):
+        return self._decorated.contents()
 
-        # Draw box
-        super().write(0, 0, tl)
-        super().write(0, maxcol - 2, tr)
-        super().write(maxrow - 2, 0, bl)
-        super().write(maxrow - 2, maxcol - 2, br)
-        for col in [0, maxcol - 2]:
-            for row in range(1, maxrow - 2):
-                super().write(row, col, side)
-        for row in [0, maxrow - 2]:
-            for col in range(1, maxcol - 2):
-                super().write(row, col, flat)
+    def find(self, cls):
+        if isinstance(self._child, cls):
+            return self._child
+        return self._child.find(cls)
 
-        # Draw shadow
-        for col in range(1, maxcol - 1):
-            super().write(maxrow - 1, col, shade)
-        for row in range(1, maxrow):
-            try:
-                super().write(row, maxcol - 1, shade)
-            except curses.error:
-                pass
+    def __getattr__(self, name):
+        return getattr(self._decorated, name)
 
-        self.noutrefresh()
+class Box(Decorator):
+    def __init__(
+        self, child=Empty(),
+        tl="┌", tr="┐", bl = "└", br = "┘",
+        side = "│", flat = "─"
+    ):
+        super().__init__(child)
+        self._tl = tl; self._tr = tr
+        self._bl = bl; self._br = br
+        self._side = side; self._flat = flat
 
-    def maxrowcol(self):
-        row, col = super().maxrowcol()
-        return row - 3, col - 3 # side + side + shadow = 3
+    def min_width(self):
+        return 2 + self._decorated.min_width()
 
-    def write(self, row, col, *attr):
-        super().write(row + 1, col + 1, *attr)
+    def min_height(self):
+        return 2 + self._decorated.min_height()
 
-class QuestionForm(Shadow):
-    def __init__(self):
-        super().__init__(curses.LINES - 3, curses.COLS - 2, 2, 1)
-        self._title = ""
-        self._close_date = None
-        self._is_discrete = False
-        self._is_date = False
-        self._has_infinity = False
-        self._active = "title"
+    def dim(self, maxrow, maxcol):
+        r, c = self._decorated.dim(maxrow - 2, maxcol - 2)
+        return r + 2, c + 2
 
-    def get_input(self):
-        self.top()
-        try:
-            curses.curs_set(2) # visible cursor
-            curses.echo()
-            self._window.move(1, 8)
-            while True:
-                if self._active == "title":
-                    currow, curcol = self._window.getyx()
-                    self.draw() # may move cursor, so we have to reset it
-                    self._window.move(currow, curcol)
-                else:
-                    self.draw()
-                curses.doupdate()
-                c = self._window.getch()
-                if c == ord("q") and not self._active == "title":
-                    raise QuitCommand
-                if self._active == "title":
-                    if c == curses.KEY_BACKSPACE:
-                        row, col = self._window.getyx()
-                        self.write(row - 1, col - 1, " ")
-                        self._window.move(row, col)
-                    elif c == ord("\n"):
-                        break
-                    elif c == ord("\t"):
-                        self._active = "discrete"
-                elif self._active == "discrete":
-                    if c == ord("\n"):
-                        self._is_discrete = not self._is_discrete
-                    if c == ord("\t"):
-                        self._active = "date"
-                elif self._active == "date":
-                    if c == ord("\n"):
-                        self._is_date = not self._is_date
-                    if c == ord("\t"):
-                        self._active = "infinity"
-                elif self._active == "infinity":
-                    if c == ord("\n"):
-                        self._has_infinity = not self._has_infinity
-            curses.curs_set(0)
-            curses.noecho()
-        finally:
-            curses.curs_set(0)
-            curses.noecho()
-        self.hide()
+    def draw(self, writer):
+        maxrow, maxcol = writer.dim()
+        h, w = self._decorated.dim(maxrow - 2, maxcol - 2)
+        h += 2; w += 2
 
-    def draw(self):
-        self.write(0, 0, "Title: ")
-        self.write(1, 0, "Close date: ")
+        # Corners
+        writer.write(0, 0, self._tl); writer.write(0, w - 1, self._tr)
+        writer.write(h - 1, 0, self._bl); writer.write(h - 1, w - 1, self._br)
 
-        if self._active == "discrete":
-            self.write(2, 0, "☑" if self._is_discrete else "☐", curses.A_REVERSE)
-            self.write(2, 2, "discrete values")
+        # Top/bottom
+        for c in range(1, w - 1):
+            writer.write(0, c, self._flat)
+            writer.write(h - 1, c, self._flat)
+        # Left/right
+        for r in range(1, h - 1):
+            writer.write(r, 0, self._side)
+            writer.write(r, w - 1, self._side)
+
+        rcrop = maxcol - w + 1
+        bcrop = maxrow - h + 1
+        self._decorated.draw(Crop(writer, [1, rcrop, bcrop, 1]))
+
+class Shadow(Decorator):
+    def __init__(self, child=Empty(), shade="░"):
+        super().__init__(child)
+        self._shade = shade
+
+    def min_width(self):
+        return 1 + self._decorated.min_width()
+
+    def min_height(self):
+        return 1 + self._decorated.min_height()
+
+    def dim(self, maxrow, maxcol):
+        r, c = self._decorated.dim(maxrow - 1, maxcol - 1)
+        return r + 1, c + 1
+
+    def draw(self, writer):
+        maxrow, maxcol = writer.dim()
+        h, w = self._decorated.dim(maxrow - 1, maxcol - 1)
+        h += 1; w += 1
+        for r in range(1, h):
+            writer.write(r, w - 1, self._shade)
+        for c in range(1, w):
+            writer.write(h - 1, c, self._shade)
+        self._decorated.draw(Crop(writer, [0, 1, 1, 0]))
+
+class Fill(Decorator):
+    def __init__(self, child=Empty(), horizontal=True, vertical=True):
+        super().__init__(child)
+        self._horizontal = horizontal
+        self._vertical = vertical
+
+    def min_width(self):
+        return self._decorated.min_width()
+
+    def min_height(self):
+        return self._decorated.min_height()
+
+    def dim(self, maxrow, maxcol):
+        if not self._horizontal or not self._vertical:
+            r, c = self._decorated.dim(maxrow, maxcol)
+        if self._vertical:
+            r = maxrow
+        if self._horizontal:
+            c = maxcol
+        return r, c
+
+    def draw(self, writer):
+        self._decorated.draw(writer)
+
+class Text(Widget):
+    def __init__(self, text):
+        self._text = text
+
+    def contents(self):
+        return self._text
+
+    def min_width(self):
+        return min([len(word) for word in self._text.split()], default = 0)
+
+    def min_height(self):
+        return 1
+
+    def dim(self, maxrow, maxcol):
+        wrapped = textwrap.wrap(self._text, maxcol)
+        return len(wrapped), max([len(line) for line in wrapped], default = 0)
+
+    def draw(self, writer):
+        _, maxcol = writer.dim()
+        wrapped = textwrap.wrap(self._text, maxcol)
+        for i, line in enumerate(wrapped):
+            writer.write(i, 0, line)
+
+class Checkbox(Widget):
+    def __init__(self, label, checked=False, focused=False):
+        self._label = label
+        self._checked = checked
+        self._focused = focused
+
+    def handle_key(self, k):
+        if k == Key.SPACE:
+            self.toggle()
+            return True
+        return False
+
+    def toggle(self):
+        self._checked = not self._checked
+
+    def checked(self):
+        return self._checked
+
+    contents = checked
+
+    def min_width(self):
+        return 2 + min([len(word) for word in self._label.split()], default = 0)
+
+    def min_height(self):
+        return 1
+
+    def dim(self, maxrow, maxcol):
+        wrapped = textwrap.wrap(self._label, maxcol - 2)
+        return len(wrapped), 2 + max([len(line) for line in wrapped], default = 0)
+
+    def draw(self, writer):
+        maxrow, maxcol = writer.dim()
+        if self._focused:
+            with writer.set(curses.A_REVERSE):
+                writer.write(0, 0, "☑" if self._checked else "☐")
         else:
-            self.write(2, 0, "☑" if self._is_discrete else "☐")
-            self.write(2, 2, "discrete values")
+            writer.write(0, 0, "☑" if self._checked else "☐")
+        wrapped = textwrap.wrap(self._label, width=maxcol-2)
+        for i, line in enumerate(wrapped):
+            writer.write(i, 2, line)
 
-        if self._active == "date":
-            self.write(3, 0, "☑" if self._is_date else "☐", curses.A_REVERSE)
-            self.write(3, 2, "is a date")
+class Clock(Widget):
+    WIDTH  = 8
+    HEIGHT = 3
+
+    def __init__(self, time=None):
+        if time is None:
+            time = dt.datetime.now()
+        self._time = time
+        self._cursor = 0 # 0 = hour, 1 = minute, 2 = AM/PM
+        self._focused = False
+
+    def min_height(self):
+        return Clock.HEIGHT
+
+    def min_width(self):
+        return Clock.WIDTH
+
+    def dim(self, maxrow, maxcol):
+        return Clock.HEIGHT, Clock.WIDTH
+
+    def handle_key(self, k):
+        if k == Key.RIGHT:
+            self.right()
+        elif k == Key.LEFT:
+            self.left()
+        elif k == Key.UP:
+            self.up()
+        elif k == Key.DOWN:
+            self.down()
         else:
-            self.write(3, 0, "☑" if self._is_date else "☐")
-            self.write(3, 2, "is a date")
+            return False
+        return True
 
-        if self._active == "infinity":
-            self.write(4, 0, "☑" if self._has_infinity else "☐", curses.A_REVERSE)
-            self.write(4, 2, "∞ is an option")
+    def right(self):
+        if self._cursor != 2:
+            self._cursor += 1
+
+    def left(self):
+        if self._cursor != 0:
+            self._cursor -= 1
+
+    def up(self):
+        if self._cursor == 0:
+            h = self._time.hour
+            self._time = self._time.replace(hour=(h+1)%24)
+        elif self._cursor == 1:
+            m = self._time.minute
+            self._time = self._time.replace(minute=(m+1)%60)
+            if m == 59:
+                self._time = self._time.replace(hour=(self._time.hour+1)%24)
         else:
-            self.write(4, 0, "☑" if self._has_infinity else "☐")
-            self.write(4, 2, "∞ is an option")
+            h = self._time.hour
+            self._time = self._time.replace(hour=(h+12)%24)
 
-        super().draw()
+    def down(self):
+        if self._cursor == 0:
+            h = self._time.hour
+            self._time = self._time.replace(hour=(h-1)%24)
+        elif self._cursor == 1:
+            m = self._time.minute
+            self._time = self._time.replace(minute=(m-1)%60)
+            if m == 0:
+                self._time = self._time.replace(hour=(self._time.hour-1)%24)
+        else:
+            h = self._time.hour
+            self._time = self._time.replace(hour=(h-12)%24)
 
-class DateForm(Shadow):
-    def __init__(self, begin_row, begin_col, start=None, **kwargs):
-        super().__init__(11, 23, begin_row, begin_col, **kwargs)
-        if start is None:
-            start = dt.date.today()
-        self._date = start
+    def draw(self, writer):
+        time = self._time
+        _, cols = writer.dim()
+        hour = time.hour % 12
+        if hour == 0:
+            hour = 12
+        hour = f"{hour:2}"
+        minute = f"{time.minute:02}"
+        am_pm = f"{time.strftime('%p')}"
+        if self._focused and self._cursor == 0:
+            writer.write(0, 1, "▲")
+            with writer.set(curses.A_REVERSE):
+                writer.write(1, 0, hour)
+            writer.write(2, 1, "▼")
+        else:
+            writer.write(1, 0, hour)
+        writer.write(1, 2, ":")
+        if self._focused and self._cursor == 1:
+            writer.write(0, 4, "▲")
+            with writer.set(curses.A_REVERSE):
+                writer.write(1, 3, minute)
+            writer.write(2, 4, "▼")
+        else:
+            writer.write(1, 3, minute)
+        if self._focused and self._cursor == 2:
+            writer.write(0, 6, "▲")
+            with writer.set(curses.A_REVERSE):
+                writer.write(1, 6, am_pm)
+            writer.write(2, 6, "▼")
+        else:
+            writer.write(1, 6, am_pm)
+
+    def contents(self):
+        return self._time
+
+class Calendar(Widget):
+    WIDTH  = 20
+    HEIGHT =  8
+
+    def __init__(self, date=None):
+        if date is None:
+            date = dt.date.today()
+        self._date = date
         self._cursor_on_month = False
-        self.addkey(curses.KEY_RIGHT, self.right, aliases=["l"])
-        self.addkey(curses.KEY_LEFT,  self.left, aliases=["h"])
-        self.addkey(curses.KEY_UP,    self.up, aliases=["k"])
-        self.addkey(curses.KEY_DOWN,  self.down, aliases=["j"])
+        self._focused = False
 
-    def get_date(self):
-        self._date = dt.date.today()
-        self.show()
-        self.draw()
-        while True:
-            key = self.react()
-            if key == Key.CLOSE:
-                self.hide()
-                return None
-            if key == ord("\n") and not self._cursor_on_month:
-                self.hide()
-                return self._date
+    def handle_key(self, k):
+        if k == Key.UP:
+            self.up()
+        elif k == Key.DOWN:
+            self.down()
+        elif k == Key.LEFT:
+            self.left()
+        elif k == Key.RIGHT:
+            self.right()
+        else:
+            return False
+        return True
 
     def up(self):
         # Move to the last week if it's still the same month.
@@ -399,7 +619,6 @@ class DateForm(Shadow):
             self._cursor_on_month = True
         else:
             self._date = dt.date(date.year, date.month, date.day - 7)
-        self.draw()
 
     def down(self):
         # Move to the next week if it's still the same month.
@@ -411,7 +630,6 @@ class DateForm(Shadow):
         else:
             _, maxday = calendar.monthrange(date.year, date.month)
             self._date = dt.date(date.year, date.month, min(date.day + 7, maxday))
-        self.draw()
 
     def right(self):
         # Move to the next date or month, as appropriate.
@@ -430,7 +648,6 @@ class DateForm(Shadow):
                     self._date = dt.date(date.year, date.month + 1, 1)
             else:
                 self._date = dt.date(date.year, date.month, date.day + 1)
-        self.draw()
 
     def left(self):
         # Move to the previous date or month, as appropriate.
@@ -449,29 +666,41 @@ class DateForm(Shadow):
                     self._date = dt.date(date.year, date.month - 1, maxday)
             else:
                 self._date = dt.date(date.year, date.month, date.day - 1)
-        self.draw()
 
-    def draw(self):
-        self._window.clear()
+    def get_date(self):
+        return self._date
+
+    contents = get_date
+
+    def min_width(self):
+        return Calendar.WIDTH
+
+    def min_height(self):
+        return Calendar.HEIGHT
+
+    def dim(self, maxrow, maxcol):
+        return Calendar.HEIGHT, Calendar.WIDTH
+
+    def draw(self, writer):
         date = self._date
-        _, cols = self.maxrowcol()
         if date.year != dt.date.today().year:
             topline = date.strftime("%B %Y")
         else:
             topline = date.strftime("%B")
 
-        lpad = (cols - len(topline)) // 2
-        if self._cursor_on_month:
-            self.write(0, lpad, topline, curses.A_STANDOUT)
+        lpad = (Calendar.WIDTH - len(topline)) // 2
+        if self._focused and self._cursor_on_month:
+            with writer.set(curses.A_REVERSE):
+                writer.write(0, lpad, topline)
         else:
-            self.write(0, lpad, topline)
-        if self._cursor_on_month:
-            self.write(0, 0, "◀")
-            self.write(0, cols - 1, "▶")
-        self.write(1, 0, "S  M  T  W  T  F  S ")
+            writer.write(0, lpad, topline)
+        if self._focused and self._cursor_on_month:
+            writer.write(0, 0, "◀")
+            writer.write(0, Calendar.WIDTH - 1, "▶")
+        writer.write(1, 0, "S  M  T  W  T  F  S ")
 
         first, ndays = calendar.monthrange(date.year, date.month)
-        # Make Sunday is the first day of the week
+        # Make Sunday the first day of the week
         first = (first + 1) % 7 # Sunday = 0
 
         for day in range(1, ndays + 1):
@@ -479,116 +708,165 @@ class DateForm(Shadow):
             col = ((first + day - 1) % 7)
             col = 3 * col
             if day == date.day and not self._cursor_on_month:
-                self.write(row + 2, col, f"{day:2}", curses.A_STANDOUT)
+                with writer.set(curses.A_REVERSE):
+                    writer.write(row + 2, col, f"{day:2}")
             else:
-                self.write(row + 2, col, f"{day:2}")
+                writer.write(row + 2, col, f"{day:2}")
 
-        super().draw()
+class Button(Widget):
+    def __init__(self, label, pressed=False):
+        self._label = label
+        self._pressed = pressed
 
-class TimeForm(Shadow):
-    def __init__(self, begin_row, begin_col, start=None, **kwargs):
-        super().__init__(6, 11, begin_row, begin_col, **kwargs)
-        if start is None:
-            start = dt.datetime.now()
-        self._time=start
-        self.addkey(curses.KEY_RIGHT, self.right, aliases=["l"])
-        self.addkey(curses.KEY_LEFT,  self.left, aliases=["h"])
-        self.addkey(curses.KEY_UP,    self.up, aliases=["k"])
-        self.addkey(curses.KEY_DOWN,  self.down, aliases=["j"])
-        self._cursor = 0 # 0 = hour, 1 = minute, 2 = AM/PM
+    def toggle(self):
+        self._pressed = not self._pressed
 
-    def right(self):
-        if self._cursor != 2:
-            self._cursor += 1
-        self.draw()
+    def pressed(self):
+        return self._pressed
 
-    def left(self):
-        if self._cursor != 0:
-            self._cursor -= 1
-        self.draw()
+    contents = pressed
 
-    def up(self):
-        if self._cursor == 0:
-            h = self._time.hour
-            self._time = self._time.replace(hour=(h+1)%24)
-        elif self._cursor == 1:
-            m = self._time.minute
-            self._time = self._time.replace(minute=(m+1)%60)
-            if m == 59:
-                self._time = self._time.replace(hour=(self._time.hour+1)%24)
+    def min_width(self):
+        return len(self._label) + 4
+
+    def min_height(self):
+        return 1
+
+    def dim(self, maxrow, maxcol):
+        return 1, len(self._label) + 4
+
+    def draw(self, writer):
+        label = self._label
+        if self._focused:
+            writer.write(0, 0, "[")
+            writer.write(0, len(label) + 3, "]")
+            with writer.set(curses.A_REVERSE):
+                writer.write(0, 2, label)
         else:
-            h = self._time.hour
-            self._time = self._time.replace(hour=(h+12)%24)
-        self.draw()
+            writer.write(0, 0, f"[ {label} ]")
 
-    def down(self):
-        if self._cursor == 0:
-            h = self._time.hour
-            self._time = self._time.replace(hour=(h-1)%24)
-        elif self._cursor == 1:
-            m = self._time.minute
-            self._time = self._time.replace(minute=(m-1)%60)
-            if m == 0:
-                self._time = self._time.replace(hour=(self._time.hour-1)%24)
-        else:
-            h = self._time.hour
-            self._time = self._time.replace(hour=(h-12)%24)
-        self.draw()
+class TextLineInput(Widget):
+    def __init__(self, placeholder=""):
+        self._placeholder = placeholder
+        self._text = []
+        self._focused = False
+        # TODO: text editing
+        # TODO: escape should unfocus
 
-    def draw(self):
-        self._window.clear()
-        time = self._time
-        _, cols = self.maxrowcol()
-        hour = time.hour % 12
-        if hour == 0:
-            hour = 12
-        hour = f"{hour:2}"
-        minute = f"{time.minute:02}"
-        am_pm = f"{time.strftime('%p')}"
-        if self._cursor == 0:
-            self.write(0, 1, "▲")
-            self.write(1, 0, hour, curses.A_STANDOUT)
-            self.write(2, 1, "▼")
-        else:
-            self.write(1, 0, hour)
-        self.write(1, 2, ":")
-        if self._cursor == 1:
-            self.write(0, 4, "▲")
-            self.write(1, 3, minute, curses.A_STANDOUT)
-            self.write(2, 4, "▼")
-        else:
-            self.write(1, 3, minute)
-        if self._cursor == 2:
-            self.write(0, 6, "▲")
-            self.write(1, 6, am_pm, curses.A_STANDOUT)
-            self.write(2, 6, "▼")
-        else:
-            self.write(1, 6, am_pm)
-        super().draw()
+    def contents(self):
+        return "".join(self._text)
 
-    def get_time(self):
-        self._time = dt.datetime.now()
-        self.show()
-        self.draw()
-        while True:
-            key = self.react()
-            if key == Key.CLOSE:
-                self.hide()
-                return None
-            if key == ord("\n"):
-                self.hide()
-                return self._time
+    def clear(self):
+        self._text = []
+
+    def handle_key(self, k):
+        if self._focused:
+            if k == Key.BACKSPACE:
+                if self._text:
+                    self._text.pop()
+                return True
+            if k == Key.BACK_TAB: # apparently is printable
+                return False
+            if k.isprint():
+                self._text.append(str(k))
+                return True
+        return False
+
+    def min_height(self):
+        return 1
+
+    def min_width(self):
+        return max(2, len(self._placeholder))
+
+    def dim(self, maxrow, maxcol):
+        return 1, maxcol
+
+    def draw(self, writer):
+        _, maxcol = writer.dim()
+        if self._focused:
+            text = self._text
+        else:
+            text = self._text or self._placeholder
+        textlen = len(text)
+        if textlen > maxcol - 1:
+            text = text[-(maxcol-1):]
+        text = "".join(text)
+        if self._focused:
+            writer.write(0, 0, text)
+            writer.write(0, len(text), "█")
+        else:
+            with writer.set(curses.A_DIM):
+                writer.write(0, 0, text)
+
+class Tags(Widget):
+    def __init__(self, placeholder=""):
+        self._input = TextLineInput(placeholder)
+        self._tags = []
+        self._focused = False
+
+    def focus(self):
+        self._input.focus()
+        self._focused = True
+
+    def unfocus(self):
+        self._input.unfocus()
+        self._focused = False
+
+    def draw(self, writer):
+        rows, cols = writer.dim()
+        self._input.draw(writer)
+        spent, _ = self._input.dim(rows, cols)
+        tags = self._tags
+        for tag in reversed(tags):
+            if rows - spent == 0:
+                break
+            writer.write(spent, 0, f"({tag} {rows-spent})")
+            spent += 1
+
+    def contents(self):
+        return self._tags
+
+    def handle_key(self, k):
+        if self._focused:
+            if self._input.handle_key(k):
+                return True
+            if k == Key.ENTER:
+                tag = self._input.contents()
+                if tag:
+                    self._input.clear()
+                    self._tags.append(tag)
+                    return True
+        return False
+
+    def min_height(self):
+        return 2
+
+    def min_width(self):
+        return max(2, len(self._input._placeholder))
+
+    def dim(self, maxrow, maxcol):
+        return min(maxrow, len(self._tags) + 3), maxcol # TODO
 
 class Info(Widget):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self):
         self._question = None
         self._predictions = []
-        self.addkey("m", self.maximize)
 
-    def draw(self):
-        self._window.clear()
-        rows, cols = self.maxrowcol()
+    def populate(self, question, predictions):
+        self._question = question
+        self._predictions = predictions
+
+    def min_height(self):
+        return min(3, len(self._items))
+
+    def min_width(self):
+        return 1 # TODO: OK?
+
+    def dim(self, maxrow, maxcol):
+        return 2, maxcol # TODO: OK?
+
+    def draw(self, writer):
+        rows, cols = writer.dim()
         q = self._question
         cd = q.close_date
         closed = cd <= dt.datetime.today()
@@ -596,18 +874,21 @@ class Info(Widget):
         # Print title at top
         title = textwrap.wrap(q.title, width=cols)
         for i, line in enumerate(title):
-            self.write(i, 0, line, curses.A_BOLD)
+            with writer.set(curses.A_BOLD):
+                writer.write(i, 0, line)
         pad = len(title)
 
         # Print close date
         if cd is None:
-            self.write(pad, 0, "close date not set", curses.A_ITALIC)
+            with writer.set(curses.A_ITALIC):
+                writer.write(pad, 0, "close date not set")
         else:
             verb = "closed" if closed else "closes"
             d = f"{cd.strftime('%b')} {cd.day}, {cd.year}"
             h = 12 if cd.hour % 12 == 0 else cd.hour % 12
             t = f"{h}:{cd.strftime('%M %p')}"
-            self.write(pad, 0, f"{verb} on {d} at {t}", curses.A_ITALIC)
+            with writer.set(curses.A_ITALIC):
+                writer.write(pad, 0, f"{verb} on {d} at {t}")
         pad += 2
 
         # Print latest prediction
@@ -617,100 +898,460 @@ class Info(Widget):
             if not closed:
                 msg += " yet"
             msg = msg.center(cols)
-            self.write(pad, 0, msg, curses.A_DIM)
-            self.noutrefresh()
+            with writer.set(curses.A_DIM):
+                writer.write(pad, 0, msg)
             return
-
         latest = predictions[0]
         distinfo = latest.json
 
-        # Special case: categorical distributions
-        labels = q.labels or [] # ensure it's not None
+        # Categorical distributions
+        labels = q.labels
         if labels:
             # In this case, the prediction should be a list of
             # probability-label objects.
-            pdict = defaultdict(int)
+            pdict = dict()
+            for lab in labels:
+                pdict[lab] = 0
             for obj in latest.json:
                 pdict[obj["label"]] = obj["p"]
-            credences = []
-            for label in labels:
-                credences.append(pdict[label])
-
-            # How wide will the labels be?
-            max_label_width = cols // 3
-            # Wrap lines
-            line_groups = [textwrap.wrap(label, width=max_label_width) for label in labels]
-            # Figure out how wide the widest label line will be
-            label_width = max([len(line) for group in line_groups for line in group])
-            # Right-align all the lines
-            line_groups = [[line.rjust(label_width) for line in group] for group in line_groups]
-
-            height = rows - pad - 2 # take off 2 for the probability axis
-            width = (
-                cols -
-                1 - # axis
-                1 - # pad
-                label_width # labels
-            )
-
-            # Print the probability axis
-            self.write(pad, label_width + 1, "0%")
-            self.write(pad, cols - 4, "100%")
-            self.write(pad + 1, label_width + 1, "├")
-            self.write(pad + 1, cols - 1, "┘")
-            for i in range(label_width + 2, cols - 1):
-                self.write(pad + 1, i, "─")
-
-            # Do we have enough rows to show all categories?
-            # If we can't show them all, we need 1 more row for a warning.
-            if len(line_groups[0]) + 1 > height:
-                # TODO: can't show even the first label, so now what?
-                pass
+            g = BarGraph(pdict)
+        else:
+            if isinstance(distinfo, list):
+                # It's a combination of distributions.
+                # In this case the format is [{"p": p, "distribution": dist}, ...],
+                # where p is a probability and dist is a distribution object.
+                dists = [(obj["p"], Distribution.from_json(obj["distribution"])) for obj in distinfo]
             else:
-                height_used = len(line_groups[0])
-                can_show = 1
-                for group in line_groups[1:]:
-                    # Once again, 1 row may be taken up by a warning.
-                    if height_used + len(group) + 1 > height:
-                        break
-                    can_show += 1
-                    height_used += len(group) + 1 # pad above
-                current_row = pad + 2
-                for i in range(can_show):
-                    if i > 0:
-                        self.write(current_row, label_width + 1, "│")
-                        current_row += 1 # pad
-                    self.write(current_row, 0, line_groups[i][0])
-                    self.write(current_row, label_width + 1, "┤")
-                    bar = round(credences[i] * width)
-                    for j in range(bar):
-                        self.write(current_row, label_width + 2 + j, " ", curses.A_REVERSE)
-                    numstr = f"{round(100 * credences[i])}%"
-                    if bar + len(numstr) <= width:
-                        self.write(current_row, label_width + 2 + bar, numstr)
-                    else:
-                        self.write(current_row, label_width + 2 + bar - len(numstr), numstr, curses.A_REVERSE)
-                    current_row += 1
-                    for line in line_groups[i][1:]:
-                        self.write(current_row, 0, line)
-                        self.write(current_row, label_width + 1, "│")
-                        current_row += 1
+                # It's a single distribution.
+                dists = [(1, Distribution.from_json(latest.json))]
+            g = LineGraph(dists, q.has_infinity, q.range_lo, q.range_hi)
+        g.draw(Crop(writer, [pad, 0, 0, 0]))
 
-                if can_show < len(line_groups):
-                    # We're missing some
-                    missing = len(line_groups) - can_show
-                    self.write(height + pad + 1, label_width + 1, f"┆ ({missing} more not shown)")
-            self.noutrefresh()
+class ScrollList(Widget):
+    class Item:
+        def __init__(self, label, hover, trigger):
+            self._label = label
+            self._hover = hover
+            self._trigger = trigger
+
+        def hover(self):
+            self._hover()
+
+        def trigger(self):
+            if self._trigger:
+                self._trigger()
+
+    def __init__(self):
+        self._items = []
+        self._cursor_item = -1 # index into list of items
+        self._cursor_row  = -1 # row of window where cursor is
+
+    def add_item(self, label, hover=None, trigger=None, prepend=False):
+        if not self._items:
+            self._cursor_item = 0
+            self._cursor_row = 0
+        it = ScrollList.Item(label, hover, trigger)
+        if prepend:
+            self._items = [it] + self._items
+        else:
+            self._items.append(it)
+
+    def min_height(self):
+        return min(3, len(self._items))
+
+    def min_width(self):
+        return 1 # TODO: OK?
+
+    def dim(self, maxrow, maxcol):
+        return min(len(self._items), maxrow), maxcol
+
+    def handle_key(self, k):
+        if k == Key.DOWN:
+            self.next()
+        elif k == Key.UP:
+            self.prev()
+        elif k == Key("g"):
+            self.first()
+        elif k == Key("G"):
+            self.last()
+        elif k == Key.ENTER:
+            self._items[self._cursor_item].trigger()
+        else:
+            return False
+        return True
+
+    def next(self):
+        nitems = len(self._items)
+        if self._cursor_item == nitems - 1: # last item
+            return
+        self._cursor_item += 1
+        self._cursor_row += 1 # may have to be reduced when drawn
+        self._items[self._cursor_item].hover()
+
+    def prev(self):
+        if self._cursor_item <= 0: # first item or empty list
+            return
+        self._cursor_item -= 1
+        if self._cursor_row > 0:
+            self._cursor_row -= 1
+        self._items[self._cursor_item].hover()
+
+    def first(self):
+        if self._items:
+            self._cursor_item = 0
+            self._cursor_row  = 0
+            self._items[0].hover()
+
+    def last(self):
+        if self._items:
+            self._cursor_item = len(self._items) - 1
+            self._cursor_row  = self._cursor_item
+            self._items[len(self._items) - 1].hover()
+
+    def draw(self, writer):
+        nitems = len(self._items)
+        if nitems == 0:
             return
 
-        if isinstance(distinfo, list):
-            dists = [(obj["p"], Distribution.from_json(obj["distribution"])) for obj in distinfo]
+        rows, cols  = writer.dim()
+        cursor_item = self._cursor_item
+        cursor_row  = min(rows - 1, self._cursor_row)
+        begin_row   = 0 # Row where the list starts, not counting arrows
+
+        if nitems <= rows: # Everything fits on screen
+            items = self._items
+            begin_index = 0
         else:
-            dists = [(1, Distribution.from_json(latest.json))]
+            # If the list is too big for the screen,
+            # we may need to draw arrows to indicate
+            # there are more items above/below the screen
+            # that aren't shown.
+            narrows = "↑ more ↑".center(cols)
+            sarrows = "↓ more ↓".center(cols)
+            space_above = cursor_row
+            space_below = rows - cursor_row - 1
+            if cursor_item == 1 and cursor_row == 0:
+                # Special case: We get pushed down, just as if we were going to
+                # draw arrows, but there's only one list item above us, so we
+                # will draw that instead.
+                space_above = cursor_row = 1
+                space_below -= 1
+            elif cursor_item > cursor_row:
+                # Need to draw arrows on top.
+                # But we may have to check again if we draw arrows on bottom.
+                if space_above > 0:
+                    space_above -= 1
+                else:
+                    # We get pushed down.
+                    cursor_row  += 1
+                    space_below -= 1
+                writer.write(0, 0, narrows)
+                begin_row = 1
+
+            if nitems - cursor_item - 1 == 1 and space_below == 0:
+                space_above -= 1
+                cursor_row  -= 1
+                space_below  = 1
+                if cursor_item == cursor_row + 1:
+                    writer.write(0, 0, narrows)
+                    space_above -= 1
+                    begin_row = 1
+            elif nitems - cursor_item - 1 > space_below:
+                # Need arrows on bottom
+                if space_below == 0: # We get pushed up.
+                    space_above -= 1
+                    cursor_row -= 1
+                    # Now we have to check for top arrows again.
+                    # This only changes things if we didn't have them already.
+                    if cursor_item == cursor_row + 1:
+                        writer.write(0, 0, narrows)
+                        space_above -= 1
+                        begin_row = 1
+                else:
+                    space_below -= 1
+                writer.write(rows - 1, 0, sarrows)
+            begin_index = cursor_item - space_above
+            end_index = cursor_item + space_below + 1
+            items = self._items[begin_index:end_index]
+            self._cursor_row = cursor_row
+
+        for i, item in enumerate(items):
+            label = textwrap.shorten(item._label, cols, placeholder=" …")
+            label = label.ljust(cols) # clears long titles while scrolling
+            if i + begin_index == cursor_item:
+                with writer.set(curses.A_BOLD):
+                    writer.write(i + begin_row, 0, label)
+            else:
+                writer.write(i + begin_row, 0, label)
+        #writer.write(rows - 1, 0, f"index: {self._cursor_item}, below: {space_below}, currow: {self._cursor_row}")
+
+# TODO:
+# [ ] arrange things nicely
+# [ ] allow fields to have an "empty" label that doesn't show
+# [ ] don't mark things with a default value (e.g. checkboxes) as required
+# [ ] make submission and cancellation possible
+class Form(Widget):
+    class Field:
+        def __init__(self, widget, action, display, required):
+            self._widget = widget
+            self._action = action
+            self._display = display
+            self._required = required
+
+        def read(self):
+            return self._action()
+
+        def __getattr__(self, name):
+            return getattr(self._widget, name)
+
+    def __init__(self):
+        self._fields = {}
+        self._focused = False
+        self._focused_field = None
+
+    def focus(self):
+        ff = self._focused_field
+        if ff is not None:
+            self._fields[ff].focus()
+
+    def unfocus(self):
+        ff = self._focused_field
+        if ff is not None:
+            self._fields[ff].unfocus()
+
+    def focus_off(self):
+        ff = self._focused_field
+        if ff is not None:
+            self._fields[ff].unfocus()
+        self._focused_field = None
+        return ff
+
+    def focus_on(self, label):
+        if label is None:
+            return self.focus_off()
+        ff = self._focused_field
+        if ff is not None:
+            self._fields[ff].unfocus()
+        self._fields[label].focus()
+        self._focused_field = label
+        return ff
+
+    def focus_next(self):
+        labels = list(self._fields.keys())
+        old_ff = self.focus_off()
+        if old_ff is None:
+            return self.focus_on(labels[0])
+        old_index = labels.index(old_ff)
+        if old_index == len(labels) - 1:
+            new_index = 0
+        else:
+            new_index = old_index + 1
+        self.focus_on(labels[new_index])
+        return old_ff
+
+    def focus_prev(self):
+        labels = list(self._fields.keys())
+        old_ff = self.focus_off()
+        if old_ff is None:
+            return self.focus_on(labels[len(labels)-1])
+        old_index = labels.index(old_ff)
+        if old_index == 0:
+            new_index = len(labels) - 1
+        else:
+            new_index = old_index - 1
+        self.focus_on(labels[new_index])
+        return old_ff
+
+    def handle_key(self, k):
+        ff = self._focused_field
+        if ff is not None:
+            handled = self._fields[ff].handle_key(k)
+            if handled:
+                return True
+        if k == Key.TAB:
+            self.focus_next()
+            return True
+        elif k == Key.BACK_TAB:
+            self.focus_prev()
+            return True
+        return False
+
+    def add_field(self, label, widget, action, display=None, required=True):
+        if display is None:
+            display = label
+        self._fields[label] = Form.Field(widget, action, display, required)
+
+    def read(self):
+        info = {}
+        for label, field in self._fields.items():
+            info[label] = field.read()
+        return info
+
+    def find(self, cls):
+        for field in self._fields.values():
+            if isinstance(field._widget, cls):
+                return field._widget
+            result = field.find(cls)
+            if result is not None:
+                return result
+        return None
+
+    def min_width(self): # TODO: revisit
+        return max([f.min_width() for f in self._fields.values()], default=0)
+
+    def min_height(self): # TODO: revisit
+        return len(self._fields) + sum([f.min_height() for f in self._fields.values()])
+
+    def dim(self, maxrow, maxcol): # TODO: revisit
+        rows_left = maxrow
+        width = 0
+        for f in self._fields.values():
+            rows_left -= 1 # for the label
+            h, w = f.dim(rows_left, maxcol)
+            width = max(w, width)
+            rows_left -= h
+        return maxrow - rows_left, width
+
+    def draw(self, writer):
+        maxrow, maxcol = writer.dim()
+        currow = nextrow = 0
+        curcol = 0
+        ff = self._focused_field
+        for label, field in self._fields.items():
+            display = "*" + field._display if field._required else field._display
+            width_needed = max(len(display), field.min_width())
+            if width_needed > maxcol - curcol:
+                currow = nextrow
+                curcol = 0
+                height, width = field.dim(maxrow - currow - 1, maxcol) # -1 for label
+            else:
+                height, width = field.dim(maxrow - currow - 1, maxcol - curcol)
+            if label == ff:
+                writer.write(currow, curcol, display)
+            else:
+                with writer.set(curses.A_DIM):
+                    writer.write(currow, curcol, display)
+            if label == ff:
+                field.draw(Crop(writer, [currow + 1, 0, 0, curcol]))
+            else:
+                with writer.set(curses.A_DIM):
+                    field.draw(Crop(writer, [currow + 1, 0, 0, curcol]))
+            curcol = curcol + width + 1
+            nextrow = max(currow + height + 1, nextrow)
+
+class Canvas(Decorator):
+    def __init__(self, child=None, rows=None, cols=None, begin_row=0, begin_col=0):
+        super().__init__(child)
+        if not rows:
+            rows = child.min_height() if child else curses.LINES
+        if not cols:
+            cols = child.min_width() if child else curses.COLS
+        self._fast_quit_enabled = True
+        self._window = curses.newwin(rows, cols, begin_row, begin_col)
+        self._window.keypad(True) # Makes arrow keys work
+        self._panel  = panel.new_panel(self._window)
+
+    def set_background(self, color):
+        self._window.bkgd(" ", curses.color_pair(color))
+
+    def get_key(self):
+        return Key(self._window.getch())
+
+    def hide(self):
+        self._panel.hide()
+        panel.update_panels()
+
+    def show(self):
+        self._panel.show()
+        panel.update_panels()
+
+    def top(self):
+        self._panel.top()
+        panel.update_panels()
+
+    def draw(self):
+        self._window.erase()
+        self._decorated.draw(CanvasWriter(self))
+        self._window.noutrefresh()
+        curses.doupdate()
+
+    def get_and_handle_key(self):
+        self.draw()
+        k = self.get_key()
+        handled = self._decorated.handle_key(k)
+        return k, handled
+
+class CanvasWriter(Writer):
+    def __init__(self, canvas):
+        self._canvas = canvas
+        self._attrs = curses.A_NORMAL 
+
+    def set_attributes(self, attrs):
+        self._attrs = attrs
+
+    def get_attributes(self):
+        return self._attrs
+
+    def dim(self):
+        return self._canvas._window.getmaxyx()
+
+    def write(self, row, col, text):
+        attrs = self._attrs
+        try:
+            if len(text) == 1:
+                self._canvas._window.addch(row, col, text, attrs)
+            else:
+                self._canvas._window.addstr(row, col, text, attrs)
+        except curses.error:
+            # This is necessary for writing on the right edge of the window.
+            pass
+
+class PrintWriter(Writer):
+    def __init__(self, maxrow, maxcol):
+        super().__init__()
+        self._maxrow = maxrow
+        self._maxcol = maxcol
+        self._lines = [list(" " * maxcol) for _ in range(maxrow)]
+
+    def write(self, row, col, text):
+        if not 0 <= row < self._maxrow:
+            raise ValueError # TODO
+        if not 0 <= col < self._maxcol:
+            raise ValueError # TODO
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            self.write_line(row, col + i, line)
+
+    def dim(self):
+        return self._maxrow, self._maxcol
+
+    def write_line(self, row, col, text):
+        chars = list(text)
+        start = col
+        end = col + len(chars)
+        self._lines[row][start:end] = chars
+
+    def __repr__(self):
+        return "\n".join(["".join(line) for line in self._lines])
+
+class Graph:
+    def draw(self, writer):
+        pass
+
+class LineGraph(Graph):
+    def __init__(self, dists, has_infinity=False, range_lo=None, range_hi=None):
+        self._dists = dists
+        self._has_infinity = has_infinity
+        self._range_lo = range_lo
+        self._range_hi = range_hi
+
+    def draw(self, writer):
+        rows, cols = writer.dim()
+        dists = self._dists
         isolated_masses = [d.point() for _, d in dists if isinstance(d, PointMass)]
         has_infinity = any([x == float("inf") for x in isolated_masses])
         all_discrete = all([isinstance(d, Discrete) for _, d in dists])
-        has_infinity = q.has_infinity
+        has_infinity = self._has_infinity
         mass_at_infinity = 0
         if has_infinity:
             for p, d in dists:
@@ -724,7 +1365,7 @@ class Info(Widget):
         #  ─┬──
         #   5
         # We need two rows for the lower axis.
-        height = rows - pad - 3 # TODO: why 3 not 2?
+        height = rows - 3 # TODO: why 3 not 2?
         width = (
             cols -
             1 - # axis
@@ -736,8 +1377,8 @@ class Info(Widget):
 
         # First we need to find the interval we will graph.
         # We /never/ go outside the question's interval.
-        hard_xmin = q.range_lo or -float("inf")
-        hard_xmax = q.range_hi or  float("inf")
+        hard_xmin = self._range_lo or -float("inf")
+        hard_xmax = self._range_hi or  float("inf")
         # And we don't bother going beyond the prediction's interval.
         soft_xmin = min([d.xmin() for _, d in dists])
         soft_xmax = max([d.xmax() for _, d in dists])
@@ -785,10 +1426,10 @@ class Info(Widget):
         ystep = ymax / height
 
         # Draw the y-axis
-        self.write(pad, 5, "┐")
+        writer.write(0, 5, "┐")
         for row in range(1, height):
-            self.write(pad + row, 5, "│")
-        self.write(pad + height, 5, "┘")
+            writer.write(row, 5, "│")
+        writer.write(height, 5, "┘")
 
         # Draw the top y label
         # TODO: handle very large ymax
@@ -798,27 +1439,27 @@ class Info(Widget):
             maxlab = str(round(ymax, ydigits))
         else:
             maxlab = "~" + str(round(ymax, ydigits - 1))
-        self.write(pad, 0, maxlab.rjust(4))
+        writer.write(0, 0, maxlab.rjust(4))
 
         # Draw the bottom y label
         # TODO: add digits after decimal if appropriate
         minlab = "0".ljust(ydigits + 1)
-        self.write(pad + height, 0, minlab.rjust(4))
+        writer.write(height, 0, minlab.rjust(4))
 
         # TODO: other y labels?  (need to decide before drawing axis)
 
         # Draw the x-axis
         # We need to decide what the labels will be first.
         for col in range(width):
-            self.write(pad + height + 1, col + 6, "─")
+            writer.write(height + 1, col + 6, "─")
         # TODO: fix
         if has_infinity:
             level = round(mass_at_infinity / ystep)
-            self.write(pad + height + 1, width + 6, "╌")
-            self.write(pad + height + 1, width + 6 + 1, "┬")
-            self.write(pad + height + 2, width + 6 + 1, "∞")
+            writer.write(height + 1, width + 6, "╌")
+            writer.write(height + 1, width + 6 + 1, "┬")
+            writer.write(height + 2, width + 6 + 1, "∞")
             for i in range(level):
-                self.write(pad + height - i, width + 6 + 1, "▓")
+                writer.write(height - i, width + 6 + 1, "▓")
         # TODO: draw x labels
 
         # Draw the function
@@ -831,191 +1472,138 @@ class Info(Widget):
             level = round(y / ystep)
             row_approx = height - round(level)
             if next_row < row_approx:
-                self.write(pad + next_row, i + 5, "╮")
+                writer.write(next_row, i + 5, "╮")
                 next_row += 1
                 while next_row < row_approx:
-                    self.write(pad + next_row, i + 5, "│")
+                    writer.write(next_row, i + 5, "│")
                     next_row += 1
-                self.write(pad + next_row, i + 5, "╰")
+                writer.write(next_row, i + 5, "╰")
             elif next_row > row_approx:
-                self.write(pad + next_row, i + 5, "╯")
+                writer.write(next_row, i + 5, "╯")
                 next_row -= 1
                 while next_row > row_approx:
-                    self.write(pad + next_row, i + 5, "│")
+                    writer.write(next_row, i + 5, "│")
                     next_row -= 1
-                self.write(pad + next_row, i + 5, "╭")
+                writer.write(next_row, i + 5, "╭")
             else:
-                self.write(pad + next_row, i + 5, "─")
+                writer.write(next_row, i + 5, "─")
 
-        self.noutrefresh()
+class BarGraph(Graph):
+    def __init__(self, categories):
+        self._cats = categories
 
-    def populate(self, question, predictions):
-        self._question = question
-        self._predictions = predictions
+    def draw(self, writer):
+        rows, cols = writer.dim()
+        labels = list(self._cats.keys())
+        credences = list(self._cats.values())
 
-    def maximize(self):
-        self._window.resize(curses.LINES, curses.COLS)
-        self._window.mvwin(0, 0)
-        self._panel.top()
-        panel.update_panels()
+        # How wide will the labels be?
+        max_label_width = cols // 3
+        # Wrap lines
+        line_groups = [textwrap.wrap(label, width=max_label_width) for label in labels]
+        # Figure out how wide the widest label line will be
+        label_width = max([len(line) for group in line_groups for line in group])
+        # Right-align all the lines
+        line_groups = [[line.rjust(label_width) for line in group] for group in line_groups]
 
-# TODO: make refresh more efficient so we don't see glitches
+        height = rows - 2 # take off 2 for the probability axis
+        width = (
+            cols -
+            1 - # axis
+            1 - # pad
+            label_width # labels
+        )
 
-class Listing(Widget):
-    def __init__(self, *args, wait=False, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.addkey(curses.KEY_DOWN, self.next, aliases=["j"])
-        self.addkey(curses.KEY_UP,   self.prev, aliases=["k"])
-        self.addkey("g", self.first)
-        self.addkey("G", self.last)
-        if wait:
-            self.addkey("\n", self.act)
-        self._wait = wait
-        self._items = []
-        self._cursor_item = 0 # index into list of items
-        self._cursor_row  = 0 # row of window where cursor is
+        # Print the probability axis
+        writer.write(0, label_width + 1, "0%")
+        writer.write(0, cols - 4, "100%")
+        writer.write(1, label_width + 1, "├")
+        writer.write(1, cols - 1, "┘")
+        for i in range(label_width + 2, cols - 1):
+            writer.write(1, i, "─")
 
-    def loop(self):
-        while True:
-            c = self.react()
-            # TODO: I'm adding this for the topbar menus
-            if c == ord("x"):
-                break
-
-    def draw(self):
-        nitems = len(self._items)
-        cursor_item = self._cursor_item
-        cursor_row  = self._cursor_row
-        rows, cols  = self.maxrowcol()
-        begin_row   = 0 # Row where the menu starts, not counting arrows
-
-        if nitems <= rows: # The whole menu fits on screen
-            menu = self._items
-            begin_index = 0
+        # Do we have enough rows to show all categories?
+        # If we can't show them all, we need 1 more row for a warning.
+        if len(line_groups[0]) + 1 > height:
+            # TODO: can't show even the first label, so now what?
+            pass
         else:
-            # If the menu is too big for the screen,
-            # we may need to draw arrows to indicate
-            # there are more items above/below the screen
-            # that aren't shown.
-            narrows = "↑ more ↑".center(cols)
-            sarrows = "↓ more ↓".center(cols)
-            space_above = cursor_row
-            if cursor_item > space_above:
-                assert(space_above > 0)
-                # Need to draw arrows on top
-                self.write(0, 0, narrows, curses.A_LEFT)
-                space_above -= 1
-                begin_row = 1
-            space_below = rows - cursor_row - 1
-            if nitems - cursor_item - 1 > space_below:
-                assert(space_below > 0)
-                # Need arrows on bottom
-                self.write(rows - 1, 0, sarrows)
-                space_below -= 1
-            begin_index = cursor_item - space_above
-            end_index = cursor_item + space_below + 1
-            menu = self._items[begin_index:end_index]
+            height_used = len(line_groups[0])
+            can_show = 1
+            for group in line_groups[1:]:
+                # Once again, 1 row may be taken up by a warning.
+                if height_used + len(group) + 2 > height:
+                    break
+                can_show += 1
+                height_used += len(group) + 1 # pad above
+            current_row = 2
+            for i in range(can_show):
+                if i > 0:
+                    writer.write(current_row, label_width + 1, "│")
+                    current_row += 1 # pad
+                writer.write(current_row, 0, line_groups[i][0])
+                writer.write(current_row, label_width + 1, "┤")
+                bar = round(credences[i] * width)
+                for j in range(bar):
+                    with writer.set(curses.A_REVERSE):
+                        writer.write(current_row, label_width + 2 + j, " ")
+                numstr = f"{round(100 * credences[i])}%"
+                if bar + len(numstr) <= width:
+                    writer.write(current_row, label_width + 2 + bar, numstr)
+                else:
+                    with writer.set(curses.A_REVERSE):
+                        writer.write(current_row, label_width + 2 + bar - len(numstr), numstr)
+                current_row += 1
+                for line in line_groups[i][1:]:
+                    writer.write(current_row, 0, line)
+                    writer.write(current_row, label_width + 1, "│")
+                    current_row += 1
 
-        for i, (label, _) in enumerate(menu):
-            label = textwrap.shorten(label, cols, placeholder=" …")
-            label = label.ljust(cols) # clears long titles while scrolling
-            if i + begin_index == cursor_item:
-                self.write(i + begin_row, 0, label, curses.A_STANDOUT)
-            else:
-                self.write(i + begin_row, 0, label)
+            if can_show < len(line_groups):
+                # We're missing some
+                missing = len(line_groups) - can_show
+                writer.write(height_used + 2, label_width + 1, f"┆ ({missing} more not shown)")
 
-        self.noutrefresh()
+#
+#        self.noutrefresh()
+#
+#    def populate(self, question, predictions):
+#        self._question = question
+#        self._predictions = predictions
+#
+#    def maximize(self):
+#        self._window.resize(curses.LINES, curses.COLS)
+#        self._window.mvwin(0, 0)
+#        self._panel.top()
+#        panel.update_panels()
 
-    def populate(self, items):
-        # TODO: do we need to account for empty lists?
-        self._items = items
-        self._cursor_item = 0 # index into list of items
-        self._cursor_row  = 0 # row of window where cursor is
-        if self._items and not self._wait:
-            self._items[0][1](self)
-        self.draw()
-
-    def next(self):
-        rows, _ = self.maxrowcol()
-        nitems  = len(self._items)
-        if not self._cursor_item < nitems - 1: # last item
-            return
-        self._cursor_item += 1
-        if not self._wait:
-            self.act()
-        # Don't go forward if we were at an arrow
-        if (nitems <= rows or
-            self._cursor_row < rows - 2 or
-            nitems - self._cursor_item < 2):
-            self._cursor_row += 1
-        self.draw()
-
-    def prev(self):
-        rows, _ = self.maxrowcol()
-        nitems  = len(self._items)
-        if self._cursor_item == 0: # first item
-            return
-        self._cursor_item -= 1
-        if not self._wait:
-            self.act()
-        # Don't go back if we were at an arrow
-        if (nitems <= rows or
-            self._cursor_row > 1 or
-            self._cursor_item < 1):
-            self._cursor_row -= 1
-        self.draw()
-
-    def act(self):
-        _, action = self._items[self._cursor_item]
-        if action is not None:
-            action(self)
-
-    def first(self):
-        self._cursor_item = 0
-        self._cursor_row  = 0
-        if not self._wait:
-            self.act()
-        self.draw()
-
-    def last(self):
-        self._cursor_item = len(self._items) - 1
-        self._cursor_row  = self.maxrowcol()[0] - 1
-        if not self._wait:
-            self.act()
-        self.draw()
-
-class ListDict(OrderedDict):
-    def __setitem__(self, key, value):
-        super().__setitem__(key, value)
-        self.move_to_end(key)
-
-class Topbar(Widget):
+# TODO: need to figure this out
+class Topbar:
     def __init__(self):
         cols = curses.COLS
         super().__init__(1, cols, 0, 0)
-        self._window.bkgd(" ", curses.color_pair(1))
-        self._submenus = ListDict()
+        #self._window.bkgd(" ", curses.color_pair(1))
+        self._submenus = dict()
         self._active_submenu = None
         # TODO: sort (or "arrange"), search, view, ...
 
-    def add_submenu(self, name, items): # TODO: aliases
+    def add_submenu(self, name, items):
         col = sum([len(n) for n in self._submenus]) + len(self._submenus)
         width = max([len(label) for label, _ in items])
-        lst = Listing(len(items), width, 1, col, wait=True)
-        lst._window.bkgd(" ", curses.color_pair(1))
-        lst.populate(items)
+        lst = Canvas(ScrollList(), rows=len(items), cols=width, begin_row=1, begin_col=col)
+        #lst._window.bkgd(" ", curses.color_pair(1))
+        for i in items:
+            lst.add_item(i)
         self._submenus[name] = lst
         initial = name[0].lower()
         self.addkey(initial, self.submenu(name))
 
     def submenu(self, name):
-        def f():
-            self._active_submenu = name
-            self.draw()
-            self._submenus[name].loop()
-            self._active_submenu = None
-            self.draw()
-        return f
+        self._active_submenu = name
+        self.draw()
+        self._submenus[name].loop()
+        self._active_submenu = None
+        self.draw()
 
     def draw(self):
         col = 0
@@ -1033,7 +1621,6 @@ class Topbar(Widget):
         self.write(0, curses.COLS - len(progname), progname, curses.A_ITALIC)
         if self._active_submenu:
             self._submenus[self._active_submenu].draw()
-        self.noutrefresh()
 
 #
 # Database
@@ -1080,48 +1667,117 @@ class Question(Base):
     def __repr__(self):
         return f"<Question {self.id}: {self.title}>"
 
+#    topbar = Topbar()
+#    topbar.add_submenu("New", [("Question", lambda _: qform.get_input()),
+#                               ("Prediction", lambda _: pform.get_input())])
+#    topbar.draw()
+
+class App:
+    def __init__(self, session):
+        self._quitting = False
+        self._session = session
+
+        form = Shadow(Box(Fill(Form()), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═"))
+        title = Box(TextLineInput(placeholder="Write your question title here"))
+        calendar = Box(Calendar())
+        clock = Box(Clock())
+        infinity_check = Checkbox("∞ is an option")
+        discrete_check = Checkbox("this is a discrete question")
+        label_set = Box(Tags())
+        form.add_field("Title", title, title.contents)
+        form.add_field("Close Date", calendar, calendar.contents)
+        form.add_field("Close Time", clock, clock.contents, required=False)
+        form.add_field("Infinity", infinity_check, infinity_check.contents, display="", required=True)
+        form.add_field("Discrete", discrete_check, discrete_check.contents, display="", required=True)
+        form.add_field("Labels", label_set, label_set.contents, display="Labels", required=False)
+        form_width = (3 * curses.COLS) // 4
+        form_vmargin = 2
+        form_height = curses.LINES - 2 * form_vmargin
+        form_hmargin = (curses.COLS - form_width) // 2
+        self._form = Canvas(
+            form,
+            rows=form_height,
+            cols=form_width,
+            begin_col=form_hmargin,
+            begin_row=form_vmargin
+        )
+        self._form.hide()
+
+        rows_under_bar = curses.LINES - 1
+        info_width = (2 * curses.COLS) // 3
+        scroll_width = curses.COLS - info_width
+
+        info = Fill(Info(), horizontal=False)
+        self._info = Canvas(info, cols=info_width, rows=rows_under_bar, begin_row=1, begin_col=scroll_width)
+
+        scroll = Fill(ScrollList(), horizontal=False)
+        questions = session.query(Question).order_by(Question.close_date.desc()).all()
+        for q in questions:
+            scroll.add_item(q.title, hover=partial(self.display_question, q))
+        self._scroll = Canvas(scroll, cols=scroll_width, rows=rows_under_bar, begin_row=1)
+        scroll.first() # Draws the first question
+
+    def display_question(self, q):
+        p = self._session.query(Prediction).filter_by(question_id=q.id).all()
+        self._info.populate(q, p)
+        self._info.draw()
+
+    def activate_form(self):
+        self._form.show()
+        while True:
+            key, handled = self._form.get_and_handle_key()
+            if handled:
+                continue
+            if key == Key.ENTER:
+                self._form.hide()
+                info = self._form.read()
+                close_date = info["Close Date"]
+                close_time = info["Close Time"]
+                close = dt.datetime(
+                    year=close_date.year,
+                    month=close_date.month,
+                    day=close_date.day,
+                    hour=close_time.hour,
+                    minute=close_time.minute
+                )
+                q = Question(
+                    title=info["Title"],
+                    discrete=info["Discrete"],
+                    is_date=False,
+                    has_infinity=info["Infinity"],
+                    labels=info["Labels"],
+                    open_date=dt.datetime.now(),
+                    close_date=close_time
+                )
+                self._session.add(q)
+                self._session.commit()
+                self._scroll.add_item(q.title, hover=partial(self.display_question, q), prepend=True)
+                self._scroll.first()
+                break
+            if key == Key.QUIT:
+                self._quitting = True
+                break
+
+    def run(self):
+        while not self._quitting:
+            key, handled = self._scroll.get_and_handle_key()
+            if handled:
+                continue
+            if key == Key("f"):
+                self.activate_form()
+            if key == Key.QUIT:
+                break
+
+TOPBAR_BG = 1
+
 def main(stdscr):
     curses.curs_set(0) # invisible cursor
     curses.start_color # enables colors
-    curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
-
-    maxrow = curses.LINES
-    maxcol = curses.COLS
-    qwidth = int(maxcol / 3)
-
-    listing = Listing(maxrow - 1, qwidth, 1, 0)
-    info = Info(maxrow - 1, maxcol - qwidth - 1, 1, qwidth + 1)
-    date = DateForm(10, 0)
-    time = TimeForm(0, 0)
-    date.center(); date.hide()
-    time.center(); time.hide()
-    qform = QuestionForm()
-    pform = QuestionForm() # TODO
-    topbar = Topbar()
-    topbar.add_submenu("New", [("Question", lambda _: qform.get_input()),
-                               ("Prediction", lambda _: pform.get_input())])
-    topbar.draw()
-    topbar.noutrefresh()
-
-    # Connect to the database
+    curses.init_pair(TOPBAR_BG, curses.COLOR_WHITE, curses.COLOR_BLUE)
     engine = create_engine("postgresql:///mydb")
     with Session(engine) as session:
-        questions = session.query(Question).order_by(Question.close_date.desc()).all()
-        def display(q):
-            def f(listing):
-                p = session.query(Prediction).filter_by(question_id=q.id).all()
-                info.populate(q, p)
-                info.draw()
-            return f
-        listing.populate([(q.title, display(q)) for q in questions])
-        listing.addkey("c", date.get_date)
-        listing.addkey("t", time.get_time)
-        listing.addkey("n", topbar.submenu("New"))
-        listing.addkey("e", topbar.submenu("Edit"))
-        try:
-            listing.loop()
-        except QuitCommand:
-            pass
+        app = App(session)
+        app.run()
 
 if __name__ == "__main__":
     curses.wrapper(main)
