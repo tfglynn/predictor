@@ -596,6 +596,59 @@ class Clock(Widget):
     def contents(self):
         return self._time
 
+class DistributionInput(Widget):
+    def __init__(
+        self, discrete=False, is_date=False, has_infinity=False,
+        range_lo=-float("inf"), range_hi=float("inf"), labels=None
+    ):
+        self._components = []
+        self._discrete = discrete
+        self._is_date = is_date
+        self._has_infinity = has_infinity
+        self._range_lo = range_lo
+        self._range_hi = range_hi
+        self._labels = labels
+
+        # This is just for demonstration
+        self._mu = 0
+        self._sigma = 1
+
+    def min_width(self):
+        return 10 # idk
+
+    def min_height(self):
+        return 10 # idk
+
+    def dim(self, maxrow, maxcol):
+        return maxrow, maxcol # idk
+
+    def handle_key(self, k):
+        if k == Key.UP:
+            self._mu += 1
+            return True
+        if k == Key.DOWN:
+            self._mu -= 1
+            return True
+        if k == Key.RIGHT:
+            if self._sigma < 1:
+                self._sigma /= 0.9
+            else:
+                self._sigma += 1
+            return True
+        if k == Key.LEFT:
+            if self._sigma <= 1:
+                self._sigma *= 0.9
+            else:
+                self._sigma -= 1
+            return True
+        return False
+
+    def draw(self, writer):
+        # Again, demonstration
+        d = Normal(self._mu, self._sigma)
+        g = LineGraph([(1, d)], self._has_infinity, self._range_lo, self._range_hi)
+        g.draw(writer)
+
 class Calendar(Widget):
     WIDTH  = 20
     HEIGHT =  8
@@ -1583,33 +1636,28 @@ class BarGraph(Graph):
                 missing = len(line_groups) - can_show
                 writer.write(height_used + 2, label_width + 1, f"┆ ({missing} more not shown)")
 
-# TODO: need to figure this out
-class Topbar:
+class Menu:
     def __init__(self):
-        cols = curses.COLS
-        super().__init__(1, cols, 0, 0)
-        #self._window.bkgd(" ", curses.color_pair(1))
+        self._main = Canvas(rows=1, cols=curses.COLS)
+        self._main.set_background(1)
         self._submenus = dict()
         self._active_submenu = None
         # TODO: sort (or "arrange"), search, view, ...
 
+    def focus_off(self):
+        self._active_submenu = None
+
     def add_submenu(self, name, items):
         col = sum([len(n) for n in self._submenus]) + len(self._submenus)
         width = max([len(label) for label, _ in items])
-        lst = Canvas(ScrollList(), rows=len(items), cols=width, begin_row=1, begin_col=col)
-        #lst._window.bkgd(" ", curses.color_pair(1))
-        for i in items:
-            lst.add_item(i)
-        self._submenus[name] = lst
-        initial = name[0].lower()
-        self.addkey(initial, self.submenu(name))
-
-    def submenu(self, name):
-        self._active_submenu = name
-        self.draw()
-        self._submenus[name].loop()
-        self._active_submenu = None
-        self.draw()
+        submenu = Canvas(
+            Shadow(ScrollList(selected=curses.A_REVERSE)),
+            rows=len(items)+1, cols=width+1, begin_row=1, begin_col=col
+        )
+        submenu.set_background(1)
+        for label, trigger in items:
+            submenu.add_item(label, trigger=trigger)
+        self._submenus[name] = submenu
 
     def draw(self):
         col = 0
@@ -1617,16 +1665,42 @@ class Topbar:
             initial = name[0]
             rest = name[1:]
             if name == self._active_submenu:
-                self.write(0, col, initial, curses.A_UNDERLINE | curses.A_REVERSE)
-                self.write(0, col + 1, rest, curses.A_REVERSE)
+                with self._main.set(curses.A_REVERSE):
+                    with self._main.set(curses.A_UNDERLINE):
+                        self._main.write(0, col, initial)
+                    self._main.write(0, col + 1, rest)
             else:
-                self.write(0, col, initial, curses.A_UNDERLINE)
-                self.write(0, col + 1, rest)
+                with self._main.set(curses.A_UNDERLINE):
+                    self._main.write(0, col, initial)
+                self._main.write(0, col + 1, rest)
             col += len(name) + 1
         progname = PROGRAM + " v" + VERSION
-        self.write(0, curses.COLS - len(progname), progname, curses.A_ITALIC)
-        if self._active_submenu:
-            self._submenus[self._active_submenu].draw()
+        with self._main.set(curses.A_ITALIC):
+            self._main.write(0, curses.COLS - len(progname), progname)
+        active = self._active_submenu
+        if active:
+            self._submenus[active].draw()
+            self._submenus[active]._window.noutrefresh()
+        self._main._window.noutrefresh()
+        curses.doupdate()
+
+    def get_and_handle_key(self):
+        self.draw()
+        k = self._main.get_key()
+        handled = self.handle_key(k)
+        return k, handled
+
+    def handle_key(self, key):
+        if self._active_submenu is None:
+            # Is the user activating the menu?
+            for name, submenu in self._submenus.items():
+                if name[0].lower() == key:
+                    self._active_submenu = name
+                    return True
+        elif self._active_submenu:
+            active = self._active_submenu
+            return self._submenus[active].handle_key(key)
+        return False
 
 #
 # Database
@@ -1673,15 +1747,15 @@ class Question(Base):
     def __repr__(self):
         return f"<Question {self.id}: {self.title}>"
 
-#    topbar = Topbar()
-#    topbar.add_submenu("New", [("Question", lambda _: qform.get_input()),
-#                               ("Prediction", lambda _: pform.get_input())])
-#    topbar.draw()
-
 class App:
     def __init__(self, session):
         self._quitting = False
         self._session = session
+
+        menu = Menu()
+        menu.add_submenu("New", [("Question",   self.new_question),
+                                 ("Prediction", self.new_prediction)])
+        self._menu = menu
 
         form = Shadow(Box(Fill(Form("New Question")), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═"))
         title = Box(TextLineInput(placeholder="Write your question title here"))
@@ -1709,6 +1783,16 @@ class App:
         )
         self._form.hide()
 
+        self._prediction_form = Canvas(
+            Shadow(Box(Fill(Form("New Prediction")), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═")),
+            rows=form_height,
+            cols=form_width,
+            begin_col=form_hmargin,
+            begin_row=form_vmargin
+        )
+        dist = DistributionInput()
+        self._prediction_form.add_field("Prediction", dist, dist.contents)
+
         rows_under_bar = curses.LINES - 1
         info_width = (2 * curses.COLS) // 3
         scroll_width = curses.COLS - info_width
@@ -1722,13 +1806,14 @@ class App:
             scroll.add_item(q.title, hover=partial(self.display_question, q))
         self._scroll = Canvas(scroll, cols=scroll_width, rows=rows_under_bar, begin_row=1)
         scroll.first() # Draws the first question
+        menu.draw()
 
     def display_question(self, q):
         p = self._session.query(Prediction).filter_by(question_id=q.id).all()
         self._info.populate(q, p)
         self._info.draw()
 
-    def activate_form(self):
+    def new_question(self):
         self._form.show()
         while True:
             key, handled = self._form.get_and_handle_key()
@@ -1767,6 +1852,19 @@ class App:
                 self._quitting = True
                 break
 
+    def new_prediction(self):
+        self._prediction_form.show()
+        while True:
+            key, handled = self._prediction_form.get_and_handle_key()
+            if handled:
+                continue
+            if key == Key.ESC:
+                self._prediction_form.hide()
+                break
+            if key == Key.QUIT:
+                self._quitting = True
+                break
+
     def run(self):
         in_menu = False
         while not self._quitting:
@@ -1788,13 +1886,11 @@ class App:
             if key == Key.QUIT:
                 break
 
-TOPBAR_BG = 1
-
 def main(stdscr):
     curses.set_escdelay(25) # makes ESC key work
     curses.curs_set(0) # invisible cursor
-    curses.start_color # enables colors
-    curses.init_pair(TOPBAR_BG, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+    curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK)
     engine = create_engine("postgresql:///mydb")
     with Session(engine) as session:
         app = App(session)
