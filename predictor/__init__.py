@@ -1473,8 +1473,6 @@ class LineGraph(Graph):
         xs = np.linspace(xmin, xmax, width)
         if all_discrete:
             xs = [round(x) for x in xs]
-        with open("log.txt", "w") as outfile:
-            print(xs, file=outfile)
 
         # Now we find out the range.
         if all_discrete:
