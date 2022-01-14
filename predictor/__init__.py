@@ -119,8 +119,14 @@ class Normal(Continuous):
         self._μ = μ
         self._σ = σ
 
+    def parameters(self):
+        return [
+            Parameter("μ", unitless=False),
+            Parameter("σ", minimum=0, unitless=False)
+        ]
+
     def pdf(self, x):
-        μ = self._μ 
+        μ = self._μ
         σ = self._σ
         return 1 / (sqrt(2 * pi) * σ) * exp(- ((x - μ) / σ) ** 2 / 2)
 
@@ -185,11 +191,14 @@ class Key:
         return str(self).isspace()
 
     def __eq__(self, other):
+        if isinstance(other, str):
+            return self == Key(other)
         return not self._aliases.isdisjoint(other._aliases)
 
     def __repr__(self):
         return f"<Key {self._name} ({self._primary})>"
 
+Key.ESC   = Key(27)
 Key.QUIT  = Key("q")
 Key.CLOSE = Key("x")
 Key.SPACE = Key(" ", name="<Space>")
@@ -1175,6 +1184,9 @@ class Form(Widget):
         elif k == Key.BACK_TAB:
             self.focus_prev()
             return True
+        elif k == Key.ESC and self._focused_field:
+            self.focus_off()
+            return True
         return False
 
     def add_field(self, label, widget, action, display=None, required=True):
@@ -1716,6 +1728,9 @@ class App:
             key, handled = self._form.get_and_handle_key()
             if handled:
                 continue
+            if key == Key.ESC:
+                self._form.hide()
+                break
             if key == Key.ENTER:
                 self._form.hide()
                 info = self._form.read()
@@ -1747,18 +1762,30 @@ class App:
                 break
 
     def run(self):
+        in_menu = False
         while not self._quitting:
-            key, handled = self._scroll.get_and_handle_key()
+            if in_menu:
+                key, handled = self._menu.get_and_handle_key()
+                if key == Key.ESC:
+                    self._menu.focus_off()
+                    self._menu.draw()
+                    in_menu = False
+                    continue
+            else:
+                key, handled = self._scroll.get_and_handle_key()
             if handled:
                 continue
-            if key == Key("f"):
-                self.activate_form()
+            if not in_menu:
+                if self._menu.handle_key(key):
+                    in_menu = True
+                    continue
             if key == Key.QUIT:
                 break
 
 TOPBAR_BG = 1
 
 def main(stdscr):
+    curses.set_escdelay(25) # makes ESC key work
     curses.curs_set(0) # invisible cursor
     curses.start_color # enables colors
     curses.init_pair(TOPBAR_BG, curses.COLOR_WHITE, curses.COLOR_BLUE)
