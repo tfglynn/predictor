@@ -393,13 +393,17 @@ class Shadow(Decorator):
         return r + 1, c + 1
 
     def draw(self, writer):
-        maxrow, maxcol = writer.dim()
-        h, w = self._decorated.dim(maxrow - 1, maxcol - 1)
-        h += 1; w += 1
-        for r in range(1, h):
-            writer.write(r, w - 1, self._shade)
-        for c in range(1, w):
-            writer.write(h - 1, c, self._shade)
+        # Setting the color is necessary in case we've changed the background.
+        with writer.set(curses.color_pair(2)):
+            maxrow, maxcol = writer.dim()
+            h, w = self._decorated.dim(maxrow - 1, maxcol - 1)
+            h += 1; w += 1
+            for r in range(1, h):
+                writer.write(r, w - 1, self._shade)
+            for c in range(1, w):
+                writer.write(h - 1, c, self._shade)
+            writer.write(h - 1, 0, " ")
+            writer.write(0, w - 1, " ")
         self._decorated.draw(Crop(writer, [0, 1, 1, 0]))
 
 class Fill(Decorator):
