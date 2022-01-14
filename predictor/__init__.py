@@ -948,13 +948,15 @@ class ScrollList(Widget):
             self._trigger = trigger
 
         def hover(self):
-            self._hover()
+            if self._hover:
+                self._hover()
 
         def trigger(self):
             if self._trigger:
                 self._trigger()
 
-    def __init__(self):
+    def __init__(self, selected=curses.A_BOLD):
+        self._selected = selected
         self._items = []
         self._cursor_item = -1 # index into list of items
         self._cursor_row  = -1 # row of window where cursor is
@@ -1092,7 +1094,7 @@ class ScrollList(Widget):
             label = textwrap.shorten(item._label, cols, placeholder=" …")
             label = label.ljust(cols) # clears long titles while scrolling
             if i + begin_index == cursor_item:
-                with writer.set(curses.A_BOLD):
+                with writer.set(self._selected):
                     writer.write(i + begin_row, 0, label)
             else:
                 writer.write(i + begin_row, 0, label)
