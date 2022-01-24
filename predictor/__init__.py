@@ -15,7 +15,7 @@ from scipy.special import gamma as gammafun
 from sqlalchemy import Boolean, Column, ForeignKey, Integer, Numeric, String, DateTime, create_engine
 from sqlalchemy.dialects.postgresql import ARRAY, JSON
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, relationship
 from time import sleep
 
 PROGRAM = "Predictor"
@@ -995,8 +995,9 @@ class Info(Widget):
 
 class ScrollList(Widget):
     class Item:
-        def __init__(self, label, hover, trigger):
+        def __init__(self, label, obj, hover, trigger):
             self._label = label
+            self._object = obj
             self._hover = hover
             self._trigger = trigger
 
@@ -1014,11 +1015,25 @@ class ScrollList(Widget):
         self._cursor_item = -1 # index into list of items
         self._cursor_row  = -1 # row of window where cursor is
 
-    def add_item(self, label, hover=None, trigger=None, prepend=False):
+    def sort(self, key, reverse=False):
+        self._items.sort(key=lambda it: key(it._object), reverse=reverse)
+
+    def pop(self):
+        if self._items:
+            i = self._cursor_item
+            if i == len(self._items) - 1:
+                self._cursor_item -= 1
+            it = self._items.pop(i)._object
+            if self._cursor_item > -1:
+                self._items[self._cursor_item].hover()
+            return it
+        return None
+
+    def add_item(self, label, obj, hover=None, trigger=None, prepend=False):
         if not self._items:
             self._cursor_item = 0
             self._cursor_row = 0
-        it = ScrollList.Item(label, hover, trigger)
+        it = ScrollList.Item(label, obj, hover, trigger)
         if prepend:
             self._items = [it] + self._items
         else:
@@ -1204,6 +1219,9 @@ class Form(Widget):
         self._fields[label].focus()
         self._focused_field = label
         return ff
+
+    def focus_first(self):
+        return self.focus_on(next(iter(self._fields)))
 
     def focus_next(self):
         labels = list(self._fields.keys())
@@ -1654,7 +1672,7 @@ class Menu:
         )
         submenu.set_background(1)
         for label, trigger in items:
-            submenu.add_item(label, trigger=trigger)
+            submenu.add_item(label, None, trigger=trigger)
         self._submenus[name] = submenu
 
     def draw(self):
@@ -1706,20 +1724,6 @@ class Menu:
 
 Base = declarative_base()
 
-class Prediction(Base):
-    """A prediction for a specific question at a specific time."""
-
-    __tablename__ = "predictions"
-
-    id = Column(Integer, primary_key=True)
-    question_id = Column(Integer, ForeignKey("question.id"))
-    datetime = Column(DateTime, nullable=False)
-    json = Column(JSON, nullable=False)
-    # TODO: add attribution (e.g. to pundits, celebrities, ...)
-
-    def __repr__(self):
-        return f"<Prediction {self.id} at {self.datetime}>"
-
 class Question(Base):
     """A question for which predictions can be made"""
 
@@ -1737,6 +1741,12 @@ class Question(Base):
     open_date = Column(DateTime, nullable=False)
     close_date = Column(DateTime)
 
+    predictions = relationship(
+        "Prediction", backref="question",
+        cascade="all, delete",
+        passive_deletes=True
+    )
+
     def __init__(self, **kwargs):
         if not kwargs["title"].endswith("?"):
             raise ValueError("title should end in '?'")
@@ -1745,14 +1755,33 @@ class Question(Base):
     def __repr__(self):
         return f"<Question {self.id}: {self.title}>"
 
+class Prediction(Base):
+    """A prediction for a specific question at a specific time."""
+
+    __tablename__ = "predictions"
+
+    id = Column(Integer, primary_key=True)
+    question_id = Column(Integer, ForeignKey(Question.id, ondelete="CASCADE"))
+
+    datetime = Column(DateTime, nullable=False)
+    json = Column(JSON, nullable=False)
+    # TODO: add attribution (e.g. to pundits, celebrities, ...)
+
+    def __repr__(self):
+        return f"<Prediction {self.id} at {self.datetime}>"
+
 class App:
     def __init__(self, session):
         self._quitting = False
         self._session = session
+        self._in_menu = False
 
         menu = Menu()
         menu.add_submenu("New", [("Question",   self.new_question),
                                  ("Prediction", self.new_prediction)])
+        menu.add_submenu("Edit", [("Delete", self.delete_question)])
+        menu.add_submenu("Arrange", [("Newest first", self.newest_first),
+                                     ("Oldest first", self.oldest_first)])
         self._menu = menu
 
         form = Shadow(Box(Fill(Form("New Question")), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═"))
@@ -1801,10 +1830,21 @@ class App:
         scroll = Fill(ScrollList(), horizontal=False)
         questions = session.query(Question).order_by(Question.close_date.desc()).all()
         for q in questions:
-            scroll.add_item(q.title, hover=partial(self.display_question, q))
+            scroll.add_item(q.title, q, hover=partial(self.display_question, q))
         self._scroll = Canvas(scroll, cols=scroll_width, rows=rows_under_bar, begin_row=1)
         scroll.first() # Draws the first question
         menu.draw()
+
+    def enter_menu(self):
+        self._in_menu = True
+
+    def exit_menu(self):
+        self._in_menu = False
+        self._menu.focus_off()
+        self._menu.draw()
+
+    def in_menu(self):
+        return self._in_menu
 
     def display_question(self, q):
         p = self._session.query(Prediction).filter_by(question_id=q.id).all()
@@ -1812,6 +1852,7 @@ class App:
         self._info.draw()
 
     def new_question(self):
+        self.exit_menu()
         self._form.show()
         while True:
             key, handled = self._form.get_and_handle_key()
@@ -1843,8 +1884,9 @@ class App:
                 )
                 self._session.add(q)
                 self._session.commit()
-                self._scroll.add_item(q.title, hover=partial(self.display_question, q), prepend=True)
+                self._scroll.add_item(q.title, q, hover=partial(self.display_question, q), prepend=True)
                 self._scroll.first()
+                self._scroll.draw()
                 break
             if key == Key.QUIT:
                 self._quitting = True
@@ -1852,6 +1894,7 @@ class App:
 
     def new_prediction(self):
         self._prediction_form.show()
+        self._prediction_form.focus_first()
         while True:
             key, handled = self._prediction_form.get_and_handle_key()
             if handled:
@@ -1863,24 +1906,39 @@ class App:
                 self._quitting = True
                 break
 
+    def delete_question(self):
+        q = self._scroll.pop()
+        self._session.delete(q)
+        self._session.commit()
+        self.exit_menu()
+        self._scroll.draw()
+
+    def newest_first(self):
+        self._scroll.sort(lambda q: q.open_date, reverse=True)
+        self.exit_menu()
+        self._scroll.draw()
+
+    def oldest_first(self):
+        self._scroll.sort(lambda q: q.open_date)
+        self.exit_menu()
+        self._scroll.draw()
+
     def run(self):
-        in_menu = False
         while not self._quitting:
-            if in_menu:
+            if self.in_menu():
                 key, handled = self._menu.get_and_handle_key()
                 if key == Key.ESC:
-                    self._menu.focus_off()
-                    self._menu.draw()
-                    in_menu = False
+                    self.exit_menu()
                     continue
             else:
                 key, handled = self._scroll.get_and_handle_key()
+                if not handled:
+                    self.enter_menu()
+                    handled = self._menu.handle_key(key)
+                    if not handled:
+                        self.exit_menu()
             if handled:
                 continue
-            if not in_menu:
-                if self._menu.handle_key(key):
-                    in_menu = True
-                    continue
             if key == Key.QUIT:
                 break
 
