@@ -24,9 +24,6 @@ VERSION = "0"
 # Interface
 #
 
-class QuitCommand(Exception):
-    pass
-
 def logfactorial(n):
     # Approximates log(n!)
     if n <= 10:
