@@ -9,7 +9,6 @@ python = ">=3.9,<3.11"
 psycopg2 = "^2.9.2"
 SQLAlchemy = "^1.4.27"
 numpy = "^1.21.4"
-python-editor = "^1.0.4"
 scipy = "^1.7.3"
 
 [tool.poetry.dev-dependencies]

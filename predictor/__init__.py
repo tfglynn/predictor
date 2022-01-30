@@ -13,10 +13,9 @@ from functools import partial
 from math import ceil, exp, factorial, log, pi, sqrt
 from scipy.special import gamma as gammafun
 from sqlalchemy import Boolean, Column, ForeignKey, Integer, Numeric, String, DateTime, create_engine
-from sqlalchemy.dialects.postgresql import ARRAY, JSON
+from sqlalchemy.dialects.postgresql import ARRAY
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship
-from time import sleep
 
 PROGRAM = "Predictor"
 VERSION = "0"
@@ -1725,21 +1724,15 @@ class Menu:
 Base = declarative_base()
 
 class Question(Base):
-    """A question for which predictions can be made"""
-
     __tablename__ = "questions"
 
     id = Column(Integer, primary_key=True)
+    kind = Column(String(), nullable=False)
     title = Column(String(), nullable=False)
-    discrete = Column(Boolean(), nullable=False)
-    is_date = Column(Boolean(), nullable=False)
-    has_infinity = Column(Boolean(), nullable=False)
-    range_lo = Column(Numeric()) # -infinity if null
-    range_hi = Column(Numeric()) # +infinity if null
-    labels = Column(ARRAY(String))
     description = Column(String())
     open_date = Column(DateTime, nullable=False)
     close_date = Column(DateTime)
+    expiry_date = Column(DateTime)
 
     predictions = relationship(
         "Prediction", backref="question",
@@ -1747,28 +1740,117 @@ class Question(Base):
         passive_deletes=True
     )
 
+    __mapper__args = {
+        "polymorphic_identity": "question",
+        "polymorphic_on": kind
+    }
+
     def __init__(self, **kwargs):
-        if not kwargs["title"].endswith("?"):
-            raise ValueError("title should end in '?'")
-        Base.__init__(self, **kwargs)
+        kwargs["open_date"] = dt.datetime.now()
+        super().__init__(**kwargs)
 
     def __repr__(self):
         return f"<Question {self.id}: {self.title}>"
 
-class Prediction(Base):
-    """A prediction for a specific question at a specific time."""
+class CategoricalQuestion(Question):
+    __tablename__ = "categorical_questions"
 
+    id = Column(Integer, ForeignKey(Question.id), primary_key=True)
+    extendable = Column(Boolean(), nullable=False)
+    categories = relationship(
+        "Category", backref="question",
+        cascade="all, delete",
+        passive_deletes=True
+    )
+
+    __mapper_args__ = {
+        "polymorphic_identity": "categorical"
+    }
+
+class BinaryQuestion(Question):
+    __tablename__ = "binary_questions"
+
+    id = Column(Integer, ForeignKey(Question.id), primary_key=True)
+
+    __mapper_args__ = {
+        "polymorphic_identity": "binary"
+    }
+
+    def __init__(self, **kwargs):
+        kwargs["kind"] = BinaryQuestion.__mapper_args__["polymorphic_identity"]
+        super().__init__(**kwargs)
+
+class NumericQuestion(Question):
+    __tablename__ = "numeric_questions"
+
+    id = Column(Integer, ForeignKey(Question.id), primary_key=True)
+    discrete = Column(Boolean(), nullable=False)
+    right_mass = Column(Boolean(), nullable=False)
+    left_mass = Column(Boolean(), nullable=False)
+    range_lo = Column(Numeric()) # -infinity if null
+    range_hi = Column(Numeric()) # +infinity if null
+
+    __mapper_args__ = {
+        "polymorphic_identity": "numeric"
+    }
+
+#class DateQuestion(Question):
+#    __tablename__ = "date_questions"
+#
+#    id = Column(Integer, ForeignKey(Question.id), primary_key=True)
+#    right_mass = Column(Boolean(), nullable=False)
+#    left_mass = Column(Boolean(), nullable=False)
+#    range_lo = Column(Numeric()) # -infinity if null
+#    range_hi = Column(Numeric()) # +infinity if null
+#
+#    __mapper_args__ = {
+#        "polymorphic_identity": "numeric"
+#    }
+
+class Category(Base):
+    __tablename__ = "categories"
+
+    id = Column(Integer, primary_key=True)
+    question_id = Column(Integer, ForeignKey(CategoricalQuestion.id, ondelete="CASCADE"))
+    name = Column(String(), nullable=False)
+    hidden = Column(Boolean(), nullable=False)
+
+class Prediction(Base):
     __tablename__ = "predictions"
 
     id = Column(Integer, primary_key=True)
+    kind = Column(String(), nullable=False)
     question_id = Column(Integer, ForeignKey(Question.id, ondelete="CASCADE"))
-
     datetime = Column(DateTime, nullable=False)
-    json = Column(JSON, nullable=False)
     # TODO: add attribution (e.g. to pundits, celebrities, ...)
+
+    __mapper__args = {
+        "polymorphic_identity": "prediction",
+        "polymorphic_on": kind
+    }
 
     def __repr__(self):
         return f"<Prediction {self.id} at {self.datetime}>"
+
+class CategoricalPrediction(Prediction):
+    __tablename__ = "categorical_predictions"
+
+    id = Column(Integer, ForeignKey(Prediction.id), primary_key=True)
+    probs = ARRAY(Column("prob", Integer, nullable=False), dimensions=1)
+
+    __mapper_args__ = {
+        "polymorphic_identity": "categorical"
+    }
+
+class BinaryPrediction(Prediction):
+    __tablename__ = "binary_predictions"
+
+    id = Column(Integer, ForeignKey(Prediction.id), primary_key=True)
+    prob = Column(Integer, nullable=False)
+
+    __mapper_args__ = {
+        "polymorphic_identity": "binary"
+    }
 
 class App:
     def __init__(self, session):
