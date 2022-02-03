@@ -1040,10 +1040,14 @@ class ScrollList(Widget):
         def hover(self):
             if self._hover:
                 self._hover()
+                return True
+            return False
 
         def trigger(self):
             if self._trigger:
                 self._trigger()
+                return True
+            return False
 
     def __init__(self, selected=curses.A_BOLD):
         self._selected = selected
@@ -1065,6 +1069,10 @@ class ScrollList(Widget):
             return it
         return None
 
+    def current_label(self):
+        if self._items:
+            return self._items[self._cursor_item]._label
+
     def add_item(self, label, obj, hover=None, trigger=None, prepend=False):
         if not self._items:
             self._cursor_item = 0
@@ -1082,7 +1090,9 @@ class ScrollList(Widget):
         return 1 # TODO: OK?
 
     def dim(self, maxrow, maxcol):
-        return min(len(self._items), maxrow), maxcol
+        rows = min(len(self._items), maxrow)
+        cols = max(len(it._label) for it in self._items)
+        return rows, cols
 
     def handle_key(self, k):
         if k == Key.DOWN:
@@ -1094,7 +1104,7 @@ class ScrollList(Widget):
         elif k == Key("G"):
             self.last()
         elif k == Key.ENTER:
-            self._items[self._cursor_item].trigger()
+            return self._items[self._cursor_item].trigger()
         else:
             return False
         return True
@@ -1889,6 +1899,15 @@ class BinaryPrediction(Prediction):
         "polymorphic_identity": "binary"
     }
 
+def date_time(date, time):
+    return dt.datetime(
+        year=date.year,
+        month=date.month,
+        day=date.day,
+        hour=time.hour,
+        minute=time.minute
+    )
+
 class App:
     def __init__(self, session):
         self._quitting = False
@@ -1903,31 +1922,55 @@ class App:
                                      ("Oldest first", self.oldest_first)])
         self._menu = menu
 
-        form = Shadow(Box(Fill(Form("New Question")), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═"))
+        picker = Shadow(Box(
+            Titled("What kind of question?", ScrollList(selected=curses.A_REVERSE)),
+            tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═"
+        ))
+        picker.add_item("Binary", None)
+        picker.add_item("Categorical", None)
+        picker.add_item("Numeric", None)
+        picker_rows, picker_cols = picker.dim(curses.LINES, curses.COLS)
+        picker_hmargin = (curses.COLS - picker_cols) // 2
+        picker_vmargin = (curses.LINES - picker_rows) // 2
+        self._picker = Canvas(
+            picker,
+            rows=picker_rows,
+            cols=picker_cols,
+            begin_col=picker_hmargin,
+            begin_row=picker_vmargin
+        )
+        self._picker.hide()
+
+        binary_form = Shadow(Box(
+            Fill(Form("New Binary Question")),
+            tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═"
+        ))
         title = Box(TextLineInput(placeholder="Write your question title here"))
-        calendar = Box(Calendar())
-        clock = Box(Clock())
+        close_calendar = Box(Calendar())
+        close_clock = Box(Clock())
+        expiry_calendar = Box(Calendar())
+        expiry_clock = Box(Clock())
         infinity_check = Checkbox("∞ is an option")
         discrete_check = Checkbox("this is a discrete question")
         label_set = Box(Tags())
-        form.add_field("Title", title, title.contents)
-        form.add_field("Close Date", calendar, calendar.contents)
-        form.add_field("Close Time", clock, clock.contents, required=False)
-        form.add_field("Infinity", infinity_check, infinity_check.contents, display="", required=True)
-        form.add_field("Discrete", discrete_check, discrete_check.contents, display="", required=True)
-        form.add_field("Labels", label_set, label_set.contents, display="Labels", required=False)
+        binary_form.add_field("Title", title, title.contents)
+        binary_form.add_field("Close Date", close_calendar, close_calendar.contents)
+        binary_form.add_field("Close Time", close_clock, close_clock.contents, required=False)
+        binary_form.add_field("Expiry Date", expiry_calendar, expiry_calendar.contents)
+        binary_form.add_field("Expiry Time", expiry_clock, expiry_clock.contents, required=False)
+
         form_width = (3 * curses.COLS) // 4
         form_vmargin = 2
         form_height = curses.LINES - 2 * form_vmargin
         form_hmargin = (curses.COLS - form_width) // 2
-        self._form = Canvas(
-            form,
+        self._binary_form = Canvas(
+            binary_form,
             rows=form_height,
             cols=form_width,
             begin_col=form_hmargin,
             begin_row=form_vmargin
         )
-        self._form.hide()
+        self._binary_form.hide()
 
         self._prediction_form = Canvas(
             Shadow(Box(Fill(Form("New Prediction")), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═")),
@@ -1954,6 +1997,16 @@ class App:
         scroll.first() # Draws the first question
         menu.draw()
 
+    def warn(self, msg):
+        vmargin = (curses.LINES - 1) // 2
+        hmargin = (curses.COLS - len(msg)) // 2
+        warning = Canvas(Text(msg), rows=1, cols=20, begin_row = vmargin, begin_col = hmargin)
+        warning.set_background(3)
+        key, _ = warning.get_and_handle_key()
+        if key == Key.QUIT:
+            self._quitting = True
+        warning.hide()
+
     def enter_menu(self):
         self._in_menu = True
 
@@ -1972,44 +2025,42 @@ class App:
 
     def new_question(self):
         self.exit_menu()
-        self._form.show()
+        self._picker.show()
+        active_widget = self._picker
         while True:
-            key, handled = self._form.get_and_handle_key()
+            key, handled = active_widget.get_and_handle_key()
             if handled:
                 continue
-            if key == Key.ESC:
-                self._form.hide()
-                break
-            if key == Key.ENTER:
-                self._form.hide()
-                info = self._form.read()
-                close_date = info["Close Date"]
-                close_time = info["Close Time"]
-                close = dt.datetime(
-                    year=close_date.year,
-                    month=close_date.month,
-                    day=close_date.day,
-                    hour=close_time.hour,
-                    minute=close_time.minute
-                )
-                q = Question(
-                    title=info["Title"],
-                    discrete=info["Discrete"],
-                    is_date=False,
-                    has_infinity=info["Infinity"],
-                    labels=info["Labels"],
-                    open_date=dt.datetime.now(),
-                    close_date=close_time
-                )
-                self._session.add(q)
-                self._session.commit()
-                self._scroll.add_item(q.title, q, hover=partial(self.display_question, q), prepend=True)
-                self._scroll.first()
-                self._scroll.draw()
-                break
             if key == Key.QUIT:
                 self._quitting = True
-                break
+                return
+            if key == Key.ENTER:
+                if active_widget is self._picker:
+                    picked = self._picker.current_label()
+                    if picked == "Binary":
+                        self._binary_form.show()
+                        active_widget = self._binary_form
+                    else:
+                        self.warn("Not implemented yet!")
+                        continue
+                    self._picker.hide()
+                elif active_widget is self._binary_form:
+                    self._binary_form.hide()
+                    info = self._binary_form.read()
+                    close  = date_time(info["Close Date"],  info["Close Time"])
+                    expiry = date_time(info["Expiry Date"], info["Expiry Time"])
+                    q = BinaryQuestion(
+                        title=info["Title"],
+                        open_date=dt.datetime.now(),
+                        close_date=close,
+                        expiry_date=expiry
+                    )
+                    self._session.add(q)
+                    self._session.commit()
+                    self._scroll.add_item(q.title, q, hover=partial(self.display_question, q), prepend=True)
+                    self._scroll.first()
+                    self._scroll.draw()
+                    return
 
     def new_prediction(self):
         self._prediction_form.show()
@@ -2066,6 +2117,7 @@ def main(stdscr):
     curses.curs_set(0) # invisible cursor
     curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
     curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK)
+    curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_RED)
     engine = create_engine("postgresql:///mydb")
     with Session(engine) as session:
         app = App(session)
