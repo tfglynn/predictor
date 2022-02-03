@@ -632,6 +632,64 @@ class Clock(Widget):
     def contents(self):
         return self._time
 
+class CategoricalInput(Widget):
+    def __init__(self, labels):
+        self._probs = [(label, 0) for label in labels]
+        self._graph = BarGraph({label: p for label, p in self._probs})
+        self._current_label = 0
+
+    def min_width(self):
+        return max(len(label) for label, _ in self._probs) + 4 # ?
+
+    def min_height(self):
+        return len(self._probs) + 2 # ? probably not ?
+
+    def dim(self, maxrow, maxcol):
+        return maxrow, maxcol # TODO
+
+    def handle_key(self, k):
+        if k == Key.UP:
+            self.up()
+        elif k == Key.DOWN:
+            self.down()
+        elif k == Key.RIGHT:
+            self.right()
+        elif k == Key.LEFT:
+            self.left()
+        else:
+            return False
+        return True
+
+    def up(self):
+        if self._current_label == 0:
+            return
+        self._current_label -= 1
+
+    def down(self):
+        if self._current_label == len(self._probs) - 1:
+            return
+        self._current_label += 1
+
+    # TODO: adjust other probabilities automatically
+    def left(self):
+        i = self._current_label
+        l, p = self._probs[i]
+        if p > 0:
+            self._probs[i] = l, p - 1
+
+    def right(self):
+        i = self._current_label
+        l, p = self._probs[i]
+        if p < 100:
+            self._probs[i] = l, p + 1
+
+    def draw(self, writer):
+        self._graph.update({label: prob for label, prob in self._probs})
+        self._graph.draw(writer)
+
+    def contents(self):
+        return {label: prob for label, prob in self._probs}
+
 class DistributionInput(Widget):
     def __init__(
         self, discrete=False, is_date=False, has_infinity=False,
@@ -1057,6 +1115,10 @@ class ScrollList(Widget):
 
     def sort(self, key, reverse=False):
         self._items.sort(key=lambda it: key(it._object), reverse=reverse)
+
+    def get(self):
+        if self._items:
+            return self._items[self._cursor_item]._object
 
     def pop(self):
         if self._items:
@@ -1626,6 +1688,9 @@ class BarGraph(Graph):
     def __init__(self, categories):
         self._cats = categories
 
+    def update(self, categories):
+        self._cats = categories
+
     def draw(self, writer):
         rows, cols = writer.dim()
         labels = list(self._cats.keys())
@@ -1677,11 +1742,11 @@ class BarGraph(Graph):
                     current_row += 1 # pad
                 writer.write(current_row, 0, line_groups[i][0])
                 writer.write(current_row, label_width + 1, "┤")
-                bar = round(credences[i] * width)
+                bar = round(credences[i] / 100 * width)
                 for j in range(bar):
                     with writer.set(curses.A_REVERSE):
                         writer.write(current_row, label_width + 2 + j, " ")
-                numstr = f"{round(100 * credences[i])}%"
+                numstr = f"{credences[i]}%"
                 if bar + len(numstr) <= width:
                     writer.write(current_row, label_width + 2 + bar, numstr)
                 else:
@@ -1876,6 +1941,10 @@ class Prediction(Base):
         "polymorphic_on": kind
     }
 
+    def __init__(self, **kwargs):
+        kwargs["datetime"] = dt.datetime.now()
+        super().__init__(**kwargs)
+
     def __repr__(self):
         return f"<Prediction {self.id} at {self.datetime}>"
 
@@ -1898,6 +1967,10 @@ class BinaryPrediction(Prediction):
     __mapper_args__ = {
         "polymorphic_identity": "binary"
     }
+
+    def __init__(self, **kwargs):
+        kwargs["kind"] = BinaryPrediction.__mapper_args__["polymorphic_identity"]
+        super().__init__(**kwargs)
 
 def date_time(date, time):
     return dt.datetime(
@@ -1972,15 +2045,15 @@ class App:
         )
         self._binary_form.hide()
 
-        self._prediction_form = Canvas(
+        self._binary_prediction = Canvas(
             Shadow(Box(Fill(Form("New Prediction")), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═")),
             rows=form_height,
             cols=form_width,
             begin_col=form_hmargin,
             begin_row=form_vmargin
         )
-        dist = DistributionInput()
-        self._prediction_form.add_field("Prediction", dist, dist.contents)
+        prob = CategoricalInput(["Yes", "No"])
+        self._binary_prediction.add_field("Prediction", prob, prob.contents)
 
         rows_under_bar = curses.LINES - 1
         info_width = (2 * curses.COLS) // 3
@@ -2063,18 +2136,32 @@ class App:
                     return
 
     def new_prediction(self):
-        self._prediction_form.show()
-        self._prediction_form.focus_first()
-        while True:
-            key, handled = self._prediction_form.get_and_handle_key()
-            if handled:
-                continue
-            if key == Key.ESC:
-                self._prediction_form.hide()
-                break
-            if key == Key.QUIT:
-                self._quitting = True
-                break
+        q = self._scroll.get()
+        latest = self._session.query(Prediction).filter_by(question_id=q.id).first() # TODO: sort?
+        if q.kind == "binary":
+            #self._binary_prediction.populate
+            self._binary_prediction.show()
+            self._binary_prediction.focus_first()
+            while True:
+                key, handled = self._binary_prediction.get_and_handle_key()
+                if handled:
+                    continue
+                if key == Key.ESC:
+                    self._binary_prediction.hide()
+                    return
+                if key == Key.QUIT:
+                    self._quitting = True
+                    return
+                if key == Key.ENTER:
+                    info = self._binary_prediction.read()
+                    probs = info["Prediction"]
+                    p = BinaryPrediction(prob=probs["Yes"])
+                    self._session.add(p)
+                    self._session.commit()
+                    return
+        else:
+            self.warn("Not implemented yet")
+            return
 
     def delete_question(self):
         q = self._scroll.pop()
