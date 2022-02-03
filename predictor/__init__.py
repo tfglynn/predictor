@@ -427,7 +427,9 @@ class Fill(Decorator):
         self._decorated.draw(writer)
 
 class Text(Widget):
-    def __init__(self, text):
+    def __init__(self, text, align=None, bold=False):
+        self._align = align
+        self._bold = bold
         self._text = text
 
     def contents(self):
@@ -446,8 +448,46 @@ class Text(Widget):
     def draw(self, writer):
         _, maxcol = writer.dim()
         wrapped = textwrap.wrap(self._text, maxcol)
-        for i, line in enumerate(wrapped):
-            writer.write(i, 0, line)
+        if self._align == "center":
+            if self._bold:
+                with writer.set(curses.A_BOLD):
+                    for i, line in enumerate(wrapped):
+                        line = line.center(maxcol)
+                        writer.write(i, 0, line)
+            else:
+                for i, line in enumerate(wrapped):
+                    line = line.center(maxcol)
+                    writer.write(i, 0, line)
+        else:
+            if self._bold:
+                with writer.set(curses.A_BOLD):
+                    for i, line in enumerate(wrapped):
+                        line = line.center(maxcol)
+                        writer.write(i, 0, line)
+            for i, line in enumerate(wrapped):
+                writer.write(i, 0, line)
+
+class Titled(Decorator):
+    def __init__(self, title, child=Empty()):
+        self._title = Text(title, align="center", bold=True)
+        super().__init__(child)
+
+    def min_width(self):
+        return max(self._decorated.min_width(), self._title.min_width())
+
+    def min_height(self):
+        return max(self._decorated.min_height(), self._title.min_height())
+
+    def dim(self, maxrow, maxcol):
+        titlerow, titlecol = self._title.dim(maxrow, maxcol)
+        bodyrow, bodycol = self._decorated.dim(maxrow - titlerow, maxcol)
+        return titlerow + bodyrow, max(titlecol, bodycol)
+
+    def draw(self, writer):
+        maxrow, maxcol = writer.dim()
+        titlerow, titlecol = self._title.dim(maxrow, maxcol)
+        self._title.draw(writer)
+        self._decorated.draw(Crop(writer, [titlerow, 0, 0, 0]))
 
 class Checkbox(Widget):
     def __init__(self, label, checked=False, focused=False):
