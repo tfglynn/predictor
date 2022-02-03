@@ -2,7 +2,7 @@ import calendar
 import curses
 import datetime as dt
 import inspect
-import json
+import logging
 import numpy as np
 import os
 import textwrap
@@ -48,17 +48,6 @@ class Distribution:
 
     pmf = pdf
 
-    def from_json(data):
-        # TODO
-        name = data["name"]
-        if name == "normal":
-            pars = [data["parameters"][p] for p in ["mu", "sigma"]]
-            return Normal(*pars)
-        if name == "infinity":
-            return PointMass(float("inf"))
-        if name == "exponential":
-            return Exponential(data["parameters"]["lambda"])
-        raise ValueError("NOT IMPLEMENTED YET", data)
 
 def nat(n):
     return isinstance(n, int) and n >= 0
@@ -1062,30 +1051,10 @@ class Info(Widget):
                 writer.write(pad, 0, msg)
             return
         latest = predictions[0]
-        distinfo = latest.json
-
-        # Categorical distributions
-        labels = q.labels
-        if labels:
-            # In this case, the prediction should be a list of
-            # probability-label objects.
-            pdict = dict()
-            for lab in labels:
-                pdict[lab] = 0
-            for obj in latest.json:
-                pdict[obj["label"]] = obj["p"]
-            g = BarGraph(pdict)
-        else:
-            if isinstance(distinfo, list):
-                # It's a combination of distributions.
-                # In this case the format is [{"p": p, "distribution": dist}, ...],
-                # where p is a probability and dist is a distribution object.
-                dists = [(obj["p"], Distribution.from_json(obj["distribution"])) for obj in distinfo]
-            else:
-                # It's a single distribution.
-                dists = [(1, Distribution.from_json(latest.json))]
-            g = LineGraph(dists, q.has_infinity, q.range_lo, q.range_hi)
-        g.draw(Crop(writer, [pad, 0, 0, 0]))
+        if isinstance(latest, BinaryPrediction):
+            p = latest.prob
+            g = BarGraph({"Yes": p, "No": 100 - p})
+            g.draw(Crop(writer, [pad, 0, 0, 0]))
 
 class ScrollList(Widget):
     class Item:
@@ -1772,7 +1741,11 @@ class Menu:
         # TODO: sort (or "arrange"), search, view, ...
 
     def focus_off(self):
-        self._active_submenu = None
+        active = self._active_submenu
+        if active:
+            self._submenus[active].hide()
+            self._active_submenu = None
+            self.draw()
 
     def add_submenu(self, name, items):
         col = sum([len(n) for n in self._submenus]) + len(self._submenus)
@@ -1823,6 +1796,7 @@ class Menu:
             for name, submenu in self._submenus.items():
                 if name[0].lower() == key:
                     self._active_submenu = name
+                    submenu.show()
                     return True
         elif self._active_submenu:
             active = self._active_submenu
@@ -2086,13 +2060,15 @@ class App:
     def exit_menu(self):
         self._in_menu = False
         self._menu.focus_off()
-        self._menu.draw()
 
     def in_menu(self):
         return self._in_menu
 
     def display_question(self, q):
-        p = self._session.query(Prediction).filter_by(question_id=q.id).all()
+        if q.kind == "binary":
+            p = self._session.query(BinaryPrediction).filter_by(question_id=q.id).all()
+        else:
+            p = self._session.query(Prediction).filter_by(question_id=q.id).all()
         self._info.populate(q, p)
         self._info.draw()
 
@@ -2104,6 +2080,9 @@ class App:
             key, handled = active_widget.get_and_handle_key()
             if handled:
                 continue
+            if key == Key.ESC:
+                active_widget.hide()
+                return
             if key == Key.QUIT:
                 self._quitting = True
                 return
@@ -2136,6 +2115,7 @@ class App:
                     return
 
     def new_prediction(self):
+        self.exit_menu()
         q = self._scroll.get()
         latest = self._session.query(Prediction).filter_by(question_id=q.id).first() # TODO: sort?
         if q.kind == "binary":
@@ -2181,6 +2161,7 @@ class App:
         self._scroll.draw()
 
     def run(self):
+        logging.info("Started app")
         while not self._quitting:
             if self.in_menu():
                 key, handled = self._menu.get_and_handle_key()
@@ -2200,6 +2181,12 @@ class App:
                 break
 
 def main(stdscr):
+    logging.basicConfig(
+        filename="predictor.log",
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        level=logging.DEBUG
+    )
     curses.set_escdelay(25) # makes ESC key work
     curses.curs_set(0) # invisible cursor
     curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
