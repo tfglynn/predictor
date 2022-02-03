@@ -980,7 +980,7 @@ class Tags(Widget):
         for tag in reversed(tags):
             if rows - spent == 0:
                 break
-            writer.write(spent, 0, f"({tag} {rows-spent})")
+            writer.write(spent, 0, f"({tag})")
             spent += 1
 
     def contents(self):
