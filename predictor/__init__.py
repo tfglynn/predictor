@@ -1826,7 +1826,7 @@ class Question(Base):
         passive_deletes=True
     )
 
-    __mapper__args = {
+    __mapper_args__ = {
         "polymorphic_identity": "question",
         "polymorphic_on": kind
     }
