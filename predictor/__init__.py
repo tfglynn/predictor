@@ -623,13 +623,25 @@ class Clock(Widget):
         return self._time
 
 class CategoricalInput(Widget):
-    def __init__(self, labels):
-        self._probs = [(label, 0) for label in labels]
-        self._graph = BarGraph({label: p for label, p in self._probs})
+    def __init__(self):
+        self._probs = None
+        self._max = None
+        self._alter_freely = None
+        self._alter_reluctantly = None
         self._current_label = 0
+        self._graph = None
+
+    def populate(self, pairs):
+        self._probs = [(label, Fraction(n)) for label, n in pairs]
+        self._max = 101 - len(pairs)
+        self._alter_freely = list(range(len(pairs)))
+        self._alter_reluctantly = []
+        self._graph = BarGraph({label: round(p) for label, p in self._probs})
+        self._graph.highlight(self._probs[0][0])
 
     def min_width(self):
-        return max(len(label) for label, _ in self._probs) + 4 # ?
+        return 20 # TODO it's broken
+        #return max(len(label) for label, _ in self._probs) + 4 # ?
 
     def min_height(self):
         return len(self._probs) + 2 # ? probably not ?
@@ -654,31 +666,80 @@ class CategoricalInput(Widget):
         if self._current_label == 0:
             return
         self._current_label -= 1
+        self._graph.highlight(self._probs[self._current_label][0])
 
     def down(self):
         if self._current_label == len(self._probs) - 1:
             return
         self._current_label += 1
+        self._graph.highlight(self._probs[self._current_label][0])
 
-    # TODO: adjust other probabilities automatically
+    def _make_reluctant(self, label):
+        if label in self._alter_freely:
+            self._alter_freely.remove(label)
+        if label in self._alter_reluctantly:
+            self._alter_reluctantly.remove(label)
+        self._alter_reluctantly.append(label)
+
     def left(self):
         i = self._current_label
+        self._make_reluctant(i)
         l, p = self._probs[i]
-        if p > 0:
+        if round(p) > 1: # Remember!  We display the rounded version.
             self._probs[i] = l, p - 1
+            if self._alter_freely:
+                to_alter = [i for i in self._alter_freely if round(self._probs[i][1]) < self._max]
+                n = len(to_alter)
+                for index in to_alter:
+                    l, p = self._probs[index]
+                    self._probs[index] = l, p + Fraction(1, n)
+            else:
+                for index in self._alter_reluctantly:
+                    l, p = self._probs[index]
+                    if p < self._max:
+                        self._alter_reluctantly.remove(index)
+                        self._alter_freely.append(index)
+                        self._probs[index] = l, p + 1
+                        break
 
     def right(self):
         i = self._current_label
-        l, p = self._probs[i]
-        if p < 100:
+        self._make_reluctant(i)
+        ok = False
+        if self._alter_freely:
+            to_alter = [i for i in self._alter_freely if round(self._probs[i][1]) > 1]
+            n = len(to_alter)
+            if n > 0:
+                ok = True
+            for index in to_alter:
+                l, p = self._probs[index]
+                self._probs[index] = l, p - Fraction(1, n)
+        if not ok:
+            for index in self._alter_reluctantly:
+                l, p = self._probs[index]
+                if p > 1:
+                    self._alter_reluctantly.remove(index)
+                    self._alter_freely.append(index)
+                    self._probs[index] = l, p - 1
+                    ok = True
+                    break
+        if ok:
+            l, p = self._probs[i]
             self._probs[i] = l, p + 1
 
     def draw(self, writer):
-        self._graph.update({label: prob for label, prob in self._probs})
+        self._graph.update(self.contents())
         self._graph.draw(writer)
 
     def contents(self):
-        return {label: prob for label, prob in self._probs}
+        return {label: round(prob) for label, prob in self._probs}
+
+class BinaryInput(CategoricalInput):
+    def __init__(self):
+        super().__init__()
+
+    def populate(self, prob):
+        super().populate([("Yes", prob), ("No", 100 - prob)])
 
 class DistributionInput(Widget):
     def __init__(
@@ -1034,11 +1095,17 @@ class Info(Widget):
                 writer.write(pad, 0, "close date not set")
         else:
             verb = "closed" if closed else "closes"
+            if closed:
+                with writer.set(curses.A_ITALIC | curses.color_pair(4)):
+                    writer.write(pad, 0, verb)
+            else:
+                with writer.set(curses.A_ITALIC):
+                    writer.write(pad, 0, verb)
             d = f"{cd.strftime('%b')} {cd.day}, {cd.year}"
             h = 12 if cd.hour % 12 == 0 else cd.hour % 12
             t = f"{h}:{cd.strftime('%M %p')}"
             with writer.set(curses.A_ITALIC):
-                writer.write(pad, 0, f"{verb} on {d} at {t}")
+                writer.write(pad, len(verb) + 1, f"on {d} at {t}")
         pad += 2
 
         # Print latest prediction
@@ -1059,11 +1126,23 @@ class Info(Widget):
 
 class ScrollList(Widget):
     class Item:
-        def __init__(self, label, obj, hover, trigger):
+        def __init__(self, label, obj, hover, trigger, tag=None):
             self._label = label
             self._object = obj
             self._hover = hover
             self._trigger = trigger
+            self._disabled = False
+            self.tag = tag
+
+        def disable(self):
+            self._disabled = True
+
+        def enable(self):
+            self._disabled = False
+
+        def is_disabled(self):
+            logging.info(f"query is_disabled returns {self._disabled}")
+            return self._disabled
 
         def hover(self):
             if self._hover:
@@ -1082,6 +1161,21 @@ class ScrollList(Widget):
         self._items = []
         self._cursor_item = -1 # index into list of items
         self._cursor_row  = -1 # row of window where cursor is
+
+    def enable(self, tag):
+        for item in self._items:
+            if item.tag == tag:
+                logging.info(f"ENabling tag {tag}")
+                item.enable()
+                break
+
+    def disable(self, tag):
+        for item in self._items:
+            logging.info(f"checking tag {item.tag} = {tag}")
+            if item.tag == tag:
+                logging.info(f"disabling tag {tag}")
+                item.disable()
+                break
 
     def sort(self, key, reverse=False):
         self._items.sort(key=lambda it: key(it._object), reverse=reverse)
@@ -1105,11 +1199,11 @@ class ScrollList(Widget):
         if self._items:
             return self._items[self._cursor_item]._label
 
-    def add_item(self, label, obj, hover=None, trigger=None, prepend=False):
+    def add_item(self, label, obj, hover=None, trigger=None, prepend=False, tag=None):
         if not self._items:
             self._cursor_item = 0
             self._cursor_row = 0
-        it = ScrollList.Item(label, obj, hover, trigger)
+        it = ScrollList.Item(label, obj, hover=hover, trigger=trigger, tag=tag)
         if prepend:
             self._items = [it] + self._items
         else:
@@ -1136,6 +1230,9 @@ class ScrollList(Widget):
         elif k == Key("G"):
             self.last()
         elif k == Key.ENTER:
+            it = self._items[self._cursor_item]
+            if it.is_disabled():
+                return True
             return self._items[self._cursor_item].trigger()
         else:
             return False
@@ -1240,8 +1337,12 @@ class ScrollList(Widget):
             label = textwrap.shorten(item._label, cols, placeholder=" …")
             label = label.ljust(cols) # clears long titles while scrolling
             if i + begin_index == cursor_item:
-                with writer.set(self._selected):
-                    writer.write(i + begin_row, 0, label)
+                if item.is_disabled():
+                    with writer.set(curses.A_DIM):
+                        writer.write(i + begin_row, 0, label)
+                else:
+                    with writer.set(self._selected):
+                        writer.write(i + begin_row, 0, label)
             else:
                 writer.write(i + begin_row, 0, label)
         #writer.write(rows - 1, 0, f"index: {self._cursor_item}, below: {space_below}, currow: {self._cursor_row}")
@@ -1270,6 +1371,10 @@ class Form(Widget):
         self._focused = False
         self._focused_field = None
         self._title = title
+
+    def populate(self, **kwargs):
+        for label, value in kwargs.items():
+            self._fields[label].populate(value)
 
     def focus(self):
         ff = self._focused_field
@@ -1657,9 +1762,13 @@ class LineGraph(Graph):
 class BarGraph(Graph):
     def __init__(self, categories):
         self._cats = categories
+        self._highlighted = None
 
     def update(self, categories):
         self._cats = categories
+
+    def highlight(self, cat):
+        self._highlighted = cat
 
     def draw(self, writer):
         rows, cols = writer.dim()
@@ -1669,11 +1778,11 @@ class BarGraph(Graph):
         # How wide will the labels be?
         max_label_width = cols // 3
         # Wrap lines
-        line_groups = [textwrap.wrap(label, width=max_label_width) for label in labels]
+        line_groups = [(label, textwrap.wrap(label, width=max_label_width)) for label in labels]
         # Figure out how wide the widest label line will be
-        label_width = max([len(line) for group in line_groups for line in group])
+        label_width = max([len(line) for _, group in line_groups for line in group])
         # Right-align all the lines
-        line_groups = [[line.rjust(label_width) for line in group] for group in line_groups]
+        line_groups = [(label, [line.rjust(label_width) for line in group]) for label, group in line_groups]
 
         height = rows - 2 # take off 2 for the probability axis
         width = (
@@ -1693,13 +1802,13 @@ class BarGraph(Graph):
 
         # Do we have enough rows to show all categories?
         # If we can't show them all, we need 1 more row for a warning.
-        if len(line_groups[0]) + 1 > height:
+        if len(line_groups[0][1]) + 1 > height:
             # TODO: can't show even the first label, so now what?
             pass
         else:
-            height_used = len(line_groups[0])
+            height_used = len(line_groups[0][1])
             can_show = 1
-            for group in line_groups[1:]:
+            for _, group in line_groups[1:]:
                 # Once again, 1 row may be taken up by a warning.
                 if height_used + len(group) + 2 > height:
                     break
@@ -1710,7 +1819,12 @@ class BarGraph(Graph):
                 if i > 0:
                     writer.write(current_row, label_width + 1, "│")
                     current_row += 1 # pad
-                writer.write(current_row, 0, line_groups[i][0])
+                label, group = line_groups[i]
+                if self._highlighted == label:
+                    with writer.set(curses.A_REVERSE):
+                        writer.write(current_row, 0, group[0])
+                else:
+                    writer.write(current_row, 0, group[0])
                 writer.write(current_row, label_width + 1, "┤")
                 bar = round(credences[i] / 100 * width)
                 for j in range(bar):
@@ -1723,8 +1837,12 @@ class BarGraph(Graph):
                     with writer.set(curses.A_REVERSE):
                         writer.write(current_row, label_width + 2 + bar - len(numstr), numstr)
                 current_row += 1
-                for line in line_groups[i][1:]:
-                    writer.write(current_row, 0, line)
+                for line in group[1:]:
+                    if self._highlighted == label:
+                        with writer.set(curses.A_REVERSE):
+                            writer.write(current_row, 0, line)
+                    else:
+                        writer.write(current_row, 0, line)
                     writer.write(current_row, label_width + 1, "│")
                     current_row += 1
 
@@ -1757,8 +1875,16 @@ class Menu:
         )
         submenu.set_background(1)
         for label, trigger in items:
-            submenu.add_item(label, None, trigger=trigger)
+            submenu.add_item(label, None, trigger=trigger, tag=label)
         self._submenus[name] = submenu
+
+    def enable(self, name, label):
+        logging.info(f"ENabling menu {name}:{label}")
+        self._submenus[name].enable(label)
+
+    def disable(self, name, label):
+        logging.info(f"disabling menu {name}:{label}")
+        self._submenus[name].disable(label)
 
     def draw(self):
         col = 0
@@ -2001,9 +2127,6 @@ class App:
         close_clock = Box(Clock())
         expiry_calendar = Box(Calendar())
         expiry_clock = Box(Clock())
-        infinity_check = Checkbox("∞ is an option")
-        discrete_check = Checkbox("this is a discrete question")
-        label_set = Box(Tags())
         binary_form.add_field("Title", title, title.contents)
         binary_form.add_field("Close Date", close_calendar, close_calendar.contents)
         binary_form.add_field("Close Time", close_clock, close_clock.contents, required=False)
@@ -2014,6 +2137,7 @@ class App:
         form_vmargin = 2
         form_height = curses.LINES - 2 * form_vmargin
         form_hmargin = (curses.COLS - form_width) // 2
+
         self._binary_form = Canvas(
             binary_form,
             rows=form_height,
@@ -2023,6 +2147,31 @@ class App:
         )
         self._binary_form.hide()
 
+        categorical_form = Shadow(Box(
+            Fill(Form("New Categorical Question")),
+            tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═"
+        ))
+        title = Box(TextLineInput(placeholder="Write your question title here"))
+        close_calendar = Box(Calendar())
+        close_clock = Box(Clock())
+        expiry_calendar = Box(Calendar())
+        expiry_clock = Box(Clock())
+        label_set = Box(Tags())
+        categorical_form.add_field("Title", title, title.contents)
+        categorical_form.add_field("Close Date", close_calendar, close_calendar.contents)
+        categorical_form.add_field("Close Time", close_clock, close_clock.contents, required=False)
+        categorical_form.add_field("Expiry Date", expiry_calendar, expiry_calendar.contents)
+        categorical_form.add_field("Expiry Time", expiry_clock, expiry_clock.contents, required=False)
+        categorical_form.add_field("Labels", label_set, label_set.contents, required=True)
+        self._categorical_form = Canvas(
+            categorical_form,
+            rows=form_height,
+            cols=form_width,
+            begin_col=form_hmargin,
+            begin_row=form_vmargin
+        )
+        self._categorical_form.hide()
+
         self._binary_prediction = Canvas(
             Shadow(Box(Fill(Form("New Prediction")), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═")),
             rows=form_height,
@@ -2030,20 +2179,30 @@ class App:
             begin_col=form_hmargin,
             begin_row=form_vmargin
         )
-        prob = CategoricalInput(["Yes", "No"])
-        self._binary_prediction.add_field("Prediction", prob, prob.contents)
+        prob = BinaryInput()
+        self._binary_prediction.add_field("prob", prob, prob.contents, display="Prediction")
+
+        self._categorical_prediction = Canvas(
+            Shadow(Box(Fill(Form("New Prediction")), tl="╔", tr="╗", bl="╚", br="╝", side="║", flat="═")),
+            rows=form_height,
+            cols=form_width,
+            begin_col=form_hmargin,
+            begin_row=form_vmargin
+        )
+        cats = CategoricalInput()
+        self._categorical_prediction.add_field("cats", cats, cats.contents, display="Prediction")
 
         rows_under_bar = curses.LINES - 1
         info_width = (2 * curses.COLS) // 3
         scroll_width = curses.COLS - info_width
 
         info = Fill(Info(), horizontal=False)
-        self._info = Canvas(info, cols=info_width, rows=rows_under_bar, begin_row=1, begin_col=scroll_width)
+        self._info = Canvas(info, cols=(info_width - 1), rows=rows_under_bar, begin_row=1, begin_col=(scroll_width + 1))
 
         scroll = Fill(ScrollList(), horizontal=False)
         questions = session.query(Question).order_by(Question.close_date.desc()).all()
         for q in questions:
-            scroll.add_item(q.title, q, hover=partial(self.display_question, q))
+            scroll.add_item(q.title, q, hover=partial(self.hover_question, q))
         self._scroll = Canvas(scroll, cols=scroll_width, rows=rows_under_bar, begin_row=1)
         scroll.first() # Draws the first question
         menu.draw()
@@ -2068,9 +2227,13 @@ class App:
     def in_menu(self):
         return self._in_menu
 
-    def display_question(self, q):
+    def hover_question(self, q):
+        if q.is_closed():
+            self._menu.disable("New", "Prediction")
+        else:
+            self._menu.enable("New", "Prediction")
         if q.kind == "binary":
-            p = self._session.query(BinaryPrediction).filter_by(question_id=q.id).all()
+            p = self._session.query(BinaryPrediction).filter_by(question_id=q.id).order_by(Prediction.datetime.desc()).all()
         else:
             p = self._session.query(Prediction).filter_by(question_id=q.id).all()
         self._info.populate(q, p)
@@ -2096,6 +2259,9 @@ class App:
                     if picked == "Binary":
                         self._binary_form.show()
                         active_widget = self._binary_form
+                    elif picked == "Categorical":
+                        self._categorical_form.show()
+                        active_widget = self._categorical_form
                     else:
                         self.warn("Not implemented yet!")
                         continue
@@ -2103,7 +2269,7 @@ class App:
                 elif active_widget is self._binary_form:
                     self._binary_form.hide()
                     info = self._binary_form.read()
-                    close  = date_time(info["Close Date"],  info["Close Time"])
+                    close = date_time(info["Close Date"], info["Close Time"])
                     expiry = date_time(info["Expiry Date"], info["Expiry Time"])
                     q = BinaryQuestion(
                         title=info["Title"],
@@ -2113,7 +2279,31 @@ class App:
                     )
                     self._session.add(q)
                     self._session.commit()
-                    self._scroll.add_item(q.title, q, hover=partial(self.display_question, q), prepend=True)
+                    self._scroll.add_item(q.title, q, hover=partial(self.hover_question, q), prepend=True)
+                    self._scroll.first()
+                    self._scroll.draw()
+                    return
+                elif active_widget is self._categorical_form:
+                    self._categorical_form.hide()
+                    info = self._categorical_form.read()
+                    close = date_time(info["Close Date"], info["Close Time"])
+                    expiry = date_time(info["Expiry Date"], info["Expiry Time"])
+                    q = CategoricalQuestion(
+                        title=info["Title"],
+                        open_date=dt.datetime.now(),
+                        close_date=close,
+                        expiry_date=expiry,
+                        extendable=False # TODO
+                    )
+                    self._session.add(q)
+                    self._session.commit()
+                    if q.id is None:
+                        raise RuntimeError("AAAAH")
+                    for name in info["Labels"]:
+                        label = Category(question_id=q.id, name=name, hidden=False)
+                        self._session.add(label)
+                    self._session.commit()
+                    self._scroll.add_item(q.title, q, hover=partial(self.hover_question, q), prepend=True)
                     self._scroll.first()
                     self._scroll.draw()
                     return
@@ -2121,9 +2311,17 @@ class App:
     def new_prediction(self):
         self.exit_menu()
         q = self._scroll.get()
-        latest = self._session.query(Prediction).filter_by(question_id=q.id).first() # TODO: sort?
+        latest = self._session \
+            .query(Prediction) \
+            .filter_by(question_id=q.id) \
+            .order_by(Prediction.datetime.desc()) \
+            .first()
         if q.kind == "binary":
-            #self._binary_prediction.populate
+            if latest:
+                latest = self._session.query(BinaryPrediction).filter_by(id=latest.id).one()
+                self._binary_prediction.populate(prob=latest.prob)
+            else:
+                self._binary_prediction.populate(prob=0.5)
             self._binary_prediction.show()
             self._binary_prediction.focus_first()
             while True:
@@ -2136,10 +2334,39 @@ class App:
                 if key == Key.QUIT:
                     self._quitting = True
                     return
-                if key == Key.ENTER:
+                if key == Key.ENTER: # TODO: update prediction on display
+                    self._binary_prediction.hide()
                     info = self._binary_prediction.read()
-                    probs = info["Prediction"]
-                    p = BinaryPrediction(prob=probs["Yes"])
+                    probs = info["prob"]
+                    p = BinaryPrediction(prob=probs["Yes"], question_id=q.id)
+                    self._session.add(p)
+                    self._session.commit()
+                    return
+        elif q.kind == "categorical":
+            cats = self._session.query(Category).filter_by(question_id=q.id).all()
+            if latest:
+                latest = self._session.query(CategoricalPrediction).filter_by(id=latest.id).one()
+                #self._categorical_prediction.populate() # TODO
+            else:
+                n = int(100 / len(cats))
+                self._categorical_prediction.populate(cats=[(cat.name, n) for cat in cats])
+            self._categorical_prediction.show()
+            self._categorical_prediction.focus_first()
+            while True:
+                key, handled = self._categorical_prediction.get_and_handle_key()
+                if handled:
+                    continue
+                if key == Key.ESC:
+                    self._categorical_prediction.hide()
+                    return
+                if key == Key.QUIT:
+                    self._quitting = True
+                    return
+                if key == Key.ENTER: # TODO: update prediction on display
+                    self._categorical_prediction.hide()
+                    info = self._categorical_prediction.read()
+                    cats = info["cats"]
+                    p = CategoricalPrediction(probs=[prob for _, prob in cats], question_id=q.id)
                     self._session.add(p)
                     self._session.commit()
                     return
@@ -2193,10 +2420,11 @@ def main(stdscr):
     )
     curses.set_escdelay(25) # makes ESC key work
     curses.curs_set(0) # invisible cursor
-    curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
-    curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK)
-    curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_RED)
-    engine = create_engine("postgresql:///mydb")
+    curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)  # menu
+    curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK) # shadow
+    curses.init_pair(3, curses.COLOR_WHITE, curses.COLOR_RED)   # warning
+    curses.init_pair(4, curses.COLOR_RED, curses.COLOR_BLACK)   # alert
+    engine = create_engine("postgresql:///predictor_dev")
     with Session(engine) as session:
         app = App(session)
         app.run()
