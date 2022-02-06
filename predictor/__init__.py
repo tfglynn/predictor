@@ -9,11 +9,12 @@ import textwrap
 from collections import defaultdict
 from curses import panel
 from enum import Enum
+from fractions import Fraction
 from functools import partial
 from math import ceil, exp, factorial, log, pi, sqrt
 from scipy.special import gamma as gammafun
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, Numeric, String, DateTime, create_engine
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, Numeric, String, create_engine
+from sqlalchemy.types import ARRAY, TIMESTAMP
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import Session, relationship
 
@@ -1018,7 +1019,7 @@ class Info(Widget):
         rows, cols = writer.dim()
         q = self._question
         cd = q.close_date
-        closed = cd <= dt.datetime.today()
+        closed = cd <= dt.datetime.now(tz=dt.timezone.utc)
 
         # Print title at top
         title = textwrap.wrap(q.title, width=cols)
@@ -1816,9 +1817,9 @@ class Question(Base):
     kind = Column(String(), nullable=False)
     title = Column(String(), nullable=False)
     description = Column(String())
-    open_date = Column(DateTime, nullable=False)
-    close_date = Column(DateTime)
-    expiry_date = Column(DateTime)
+    open_date = Column(TIMESTAMP(timezone=True), nullable=False)
+    close_date = Column(TIMESTAMP(timezone=True))
+    expiry_date = Column(TIMESTAMP(timezone=True))
 
     predictions = relationship(
         "Prediction", backref="question",
@@ -1837,6 +1838,9 @@ class Question(Base):
 
     def __repr__(self):
         return f"<Question {self.id}: {self.title}>"
+
+    def is_closed(self):
+        return self.close_date <= dt.datetime.now(tz=dt.timezone.utc)
 
 class CategoricalQuestion(Question):
     __tablename__ = "categorical_questions"
@@ -1907,7 +1911,7 @@ class Prediction(Base):
     id = Column(Integer, primary_key=True)
     kind = Column(String(), nullable=False)
     question_id = Column(Integer, ForeignKey(Question.id, ondelete="CASCADE"))
-    datetime = Column(DateTime, nullable=False)
+    datetime = Column(TIMESTAMP(timezone=True), nullable=False)
     # TODO: add attribution (e.g. to pundits, celebrities, ...)
 
     __mapper__args = {
