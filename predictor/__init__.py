@@ -1141,7 +1141,6 @@ class ScrollList(Widget):
             self._disabled = False
 
         def is_disabled(self):
-            logging.info(f"query is_disabled returns {self._disabled}")
             return self._disabled
 
         def hover(self):
@@ -1165,15 +1164,12 @@ class ScrollList(Widget):
     def enable(self, tag):
         for item in self._items:
             if item.tag == tag:
-                logging.info(f"ENabling tag {tag}")
                 item.enable()
                 break
 
     def disable(self, tag):
         for item in self._items:
-            logging.info(f"checking tag {item.tag} = {tag}")
             if item.tag == tag:
-                logging.info(f"disabling tag {tag}")
                 item.disable()
                 break
 
@@ -1879,11 +1875,9 @@ class Menu:
         self._submenus[name] = submenu
 
     def enable(self, name, label):
-        logging.info(f"ENabling menu {name}:{label}")
         self._submenus[name].enable(label)
 
     def disable(self, name, label):
-        logging.info(f"disabling menu {name}:{label}")
         self._submenus[name].disable(label)
 
     def draw(self):
